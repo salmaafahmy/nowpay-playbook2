@@ -2332,6 +2332,15 @@ window.__NOWPAY_DATA__ = {"fees_5m": [{"min": 1, "max": 600, "fee": 20}, {"min":
 })();
 </script>
 
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script>
+const SUPABASE_URL = "https://jubjcrwsmhfcnkxhhqkm.supabase.co";
+const SUPABASE_KEY = "sb_publishable_yOcwh1QlWTetDCHuBSbWWw_KMIFeCEE";
 
+const supabaseClient = window.supabase.createClient(
+  SUPABASE_URL,
+  SUPABASE_KEY
+);
+</script>
 </body>
 </html>
