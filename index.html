@@ -636,6 +636,16 @@ window.__NOWPAY_DATA__ = {"fees_5m": [{"min": 1, "max": 600, "fee": 20}, {"min":
     SEARCH_INDEX = null;
   }
 
+  /* Extension hooks (used by kb-admin.js for the inline Edit / Add buttons).
+     Every call is isolated: a failing hook can never break the public page. */
+  const HOOKS = {};
+  function hook(name){
+    const f = HOOKS[name];
+    if(typeof f !== "function") return;
+    try{ f.apply(null, Array.prototype.slice.call(arguments, 1)); }
+    catch(e){ if(window.console) console.error("[hook:" + name + "]", e); }
+  }
+
   const CAT_ORDER = ["الحساب والتفعيل","الرصيد والمعاملات","التسوق والاستثمار","مرجع Ops","مقاييس الجودة"];
   const CAT_ICON = {
     "الحساب والتفعيل":"👤",
@@ -644,6 +654,19 @@ window.__NOWPAY_DATA__ = {"fees_5m": [{"min": 1, "max": 600, "fee": 20}, {"min":
     "مرجع Ops":"🗂️",
     "مقاييس الجودة":"📊"
   };
+  /* Categories = the 5 built-in ones + any created from the editor (kb_meta) + any category a topic already uses. */
+  function metaCats(){ const m = DATA.kb_meta; return (m && Array.isArray(m.categories)) ? m.categories : []; }
+  function catList(){
+    const out = CAT_ORDER.slice();
+    metaCats().forEach(c=>{ if(c && c.name && out.indexOf(c.name) < 0) out.push(c.name); });
+    TOPICS.forEach(t=>{ if(t.cat && out.indexOf(t.cat) < 0) out.push(t.cat); });
+    return out;
+  }
+  function catIcon(cat){
+    if(CAT_ICON[cat]) return CAT_ICON[cat];
+    const m = metaCats().find(c=> c && c.name === cat);
+    return (m && m.icon) || "📁";
+  }
   const MOST_USED = ["registration","transactions","limits-balance","update-data","block-suspension","fees-companies"];
 
   /* ---------------- Topic section -> business category map ---------------- */
@@ -820,10 +843,10 @@ window.__NOWPAY_DATA__ = {"fees_5m": [{"min": 1, "max": 600, "fee": 20}, {"min":
     const opsChips = [];
     rows.forEach(r=>{ if(r.ops_tool_record) opsChips.push({label:(r.type||"").split("\n")[0], value:r.ops_tool_record}); });
     return {
-      validation: {type:"actions_validation", title:"التحقق المطلوب قبل تنفيذ الإجراء", items: validationUniq},
-      agent_actions: {type:"actions_steps", title:"خطوات الموظف أثناء المكالمة", items: qpSteps},
-      ticket_info: {type:"actions_full", title:"تفاصيل الإجراءات", rows: rows},
-      ops_tool: {type:"actions_chips", title:"تسجيل Ops Tool حسب نوع الإجراء", items: opsChips}
+      validation: {type:"actions_validation", ref:ref, title:"التحقق المطلوب قبل تنفيذ الإجراء", items: validationUniq},
+      agent_actions: {type:"actions_steps", ref:ref, title:"خطوات الموظف أثناء المكالمة", items: qpSteps},
+      ticket_info: {type:"actions_full", ref:ref, title:"تفاصيل الإجراءات", rows: rows},
+      ops_tool: {type:"actions_chips", ref:ref, title:"تسجيل Ops Tool حسب نوع الإجراء", items: opsChips}
     };
   }
 
@@ -989,12 +1012,16 @@ window.__NOWPAY_DATA__ = {"fees_5m": [{"min": 1, "max": 600, "fee": 20}, {"min":
   function buildPage(){
     const main = document.getElementById("main-content");
     main.appendChild(buildHero());
-    CAT_ORDER.forEach(cat=>{
+    catList().forEach(cat=>{
       const items = TOPICS.filter(t=>t.cat===cat);
-      if(!items.length) return;
-      main.appendChild(el("h2",{class:"cat-heading", id:"cat-"+slug(cat)}, el("span",{class:"cat-heading-icon"},CAT_ICON[cat]||"📁"), cat));
+      const known = CAT_ORDER.indexOf(cat) >= 0;
+      if(!items.length && known) return;      /* a custom (empty) category still shows, so topics can be added to it */
+      const heading = el("h2",{class:"cat-heading", id:"cat-"+slug(cat)}, el("span",{class:"cat-heading-icon"},catIcon(cat)), cat);
+      main.appendChild(heading);
+      hook("category", heading, cat);
       items.forEach(t => main.appendChild(buildTopicCard(t, false)));
     });
+    hook("page", main);
   }
 
   function buildTopicCard(t, openDefault){
@@ -1042,22 +1069,25 @@ window.__NOWPAY_DATA__ = {"fees_5m": [{"min": 1, "max": 600, "fee": 20}, {"min":
         el("span",{class:"topic-section-icon"}, SEC_CAT_ICON[cat]),
         el("span",null, SEC_CAT_LABEL[cat])
       ));
-      secs.forEach(sec=> catBlock.appendChild(renderSection(sec)));
+      secs.forEach(sec=>{ const node = renderSection(sec); hook("section", node, t, sec); catBlock.appendChild(node); });
       body.appendChild(catBlock);
     });
 
     if(relatedSec){
-      body.appendChild(renderSection(relatedSec));
+      const rnode = renderSection(relatedSec);
+      hook("section", rnode, t, relatedSec);
+      body.appendChild(rnode);
     }
 
     details.appendChild(body);
+    hook("topic", details, body, t);
     return details;
   }
 
   /* ---------------- Sidebar ---------------- */
   function buildSidebar(){
     const nav = document.getElementById("sidebar-nav");
-    CAT_ORDER.forEach(cat=>{
+    catList().forEach(cat=>{
       const items = TOPICS.filter(t=>t.cat===cat);
       if(!items.length) return;
       const groupId = "grp-"+slug(cat);
@@ -1067,9 +1097,10 @@ window.__NOWPAY_DATA__ = {"fees_5m": [{"min": 1, "max": 600, "fee": 20}, {"min":
       const head = el("button",{class:"sb-group-head", type:"button", onclick:(ev)=>{
         const collapsed = body.classList.toggle("collapsed");
         ev.currentTarget.classList.toggle("collapsed", collapsed);
-      }}, el("span",{class:"sb-group-icon"}, CAT_ICON[cat]||"📁"), el("span",{class:"sb-group-title"}, cat), el("span",{class:"sb-group-caret"}, "⌄"));
+      }}, el("span",{class:"sb-group-icon"}, catIcon(cat)), el("span",{class:"sb-group-title"}, cat), el("span",{class:"sb-group-caret"}, "⌄"));
       nav.appendChild(el("div",{class:"sb-group"}, head, body));
     });
+    hook("sidebar", nav);
   }
   function setActiveSidebar(id){
     document.querySelectorAll(".sb-link").forEach(a=>a.classList.toggle("active", a.dataset.id===id));
@@ -1151,11 +1182,15 @@ window.__NOWPAY_DATA__ = {"fees_5m": [{"min": 1, "max": 600, "fee": 20}, {"min":
     scored.sort((a,b)=>b.score-a.score);
     return scored.slice(0,30).map(s=>s.item);
   }
+  function escHtml(s){
+    return String(s===null||s===undefined ? "" : s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+  }
   function highlightHTML(text, q){
     const terms = q.trim().split(/\s+/).filter(Boolean).map(t=>t.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'));
-    if(!terms.length) return esc(text);
+    if(!terms.length) return escHtml(text);
     const re = new RegExp("("+terms.join("|")+")","gi");
-    return esc(text).replace(re, "<mark>$1</mark>");
+    /* split() with a capture group alternates [plain, match, plain, ...]; everything is HTML-escaped */
+    return String(text===null||text===undefined ? "" : text).split(re).map((part,i)=> i % 2 ? "<mark>"+escHtml(part)+"</mark>" : escHtml(part)).join("");
   }
   function typeLabel(type){
     return {
@@ -1254,11 +1289,16 @@ window.__NOWPAY_DATA__ = {"fees_5m": [{"min": 1, "max": 600, "fee": 20}, {"min":
     window.scrollTo(0, y);
   }
   window.NowPayApp = {
-    start: start, rebuild: rebuild,
+    start: start, rebuild: rebuild, hooks: HOOKS,
     setData: setData, getData: function(){ return DATA; },
     meta: { CAT_ORDER: CAT_ORDER, CAT_ICON: CAT_ICON, SEC_CAT_ORDER: SEC_CAT_ORDER,
-            SEC_CAT_LABEL: SEC_CAT_LABEL, SEC_CAT_ICON: SEC_CAT_ICON, TOPIC_CATMAP: TOPIC_CATMAP }
+            SEC_CAT_LABEL: SEC_CAT_LABEL, SEC_CAT_ICON: SEC_CAT_ICON, TOPIC_CATMAP: TOPIC_CATMAP,
+            catList: catList, catIcon: catIcon }
   };
+  /* Public read access: the embedded Knowledge Base renders immediately, no login, no network needed.
+     kb-admin.js then swaps in the latest version from Supabase when it arrives. */
+  if(document.readyState === "loading") document.addEventListener("DOMContentLoaded", start);
+  else start();
 })();
 
 </script>
@@ -2363,8 +2403,7 @@ window.__NOWPAY_DATA__ = {"fees_5m": [{"min": 1, "max": 600, "fee": 20}, {"min":
 })();
 </script>
 
-<!-- Supabase auth + shared data (login, load kb_data, in-site editor). Publishable key only. -->
-<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.js"></script>
+<!-- Shared data + PIN-protected editor. Public read-only; all writes go through the kb-editor Edge Function. -->
 <script src="kb-admin.js"></script>
 </body>
 </html>

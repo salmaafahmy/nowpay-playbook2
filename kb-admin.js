@@ -1,23 +1,31 @@
 /* =========================================================
-   NowPay Knowledge Portal — Supabase auth + shared data + in-site editor
-   - Login / Logout (Supabase Auth, email + password, persisted session)
-   - Loads the 18 data groups from public.kb_data after authentication
-   - Lets signed-in team members add / edit knowledge; every change is saved to kb_data
-   - Falls back to the data embedded in index.html (read-only) if Supabase is unreachable
+   NowPay Knowledge Portal — public read + PIN-protected in-site editor
+   - NO login. Everyone sees the full Knowledge Base immediately (embedded copy first, then the latest
+     version from Supabase `kb_data`, read-only through the publishable key).
+   - Edit / Add buttons are visible next to every section and item. Clicking one asks for a numeric PIN.
+   - The PIN is checked ONLY by the `kb-editor` Edge Function (secret stored server-side). It is never in
+     this file. A correct PIN returns a short-lived signed token that is kept in memory only.
+   - Every save goes through the Edge Function, which backs up the previous content first.
    Only the publishable key is used here. Never put a secret / service-role key in this file.
    ========================================================= */
 (function(){
   "use strict";
+  if(!window.NowPayApp){ return; }
 
   var SUPABASE_URL = "https://jubjcrwsmhfcnkxhhqkm.supabase.co";
   var SUPABASE_KEY = "sb_publishable_yOcwh1QlWTetDCHuBSbWWw_KMIFeCEE";
+  var CFG = window.NOWPAY_CONFIG || {};               /* optional override (used by tests / staging) */
+  if(CFG.url) SUPABASE_URL = CFG.url;
+  if(CFG.key) SUPABASE_KEY = CFG.key;
   var TABLE = "kb_data";
+  var FN_URL = SUPABASE_URL + "/functions/v1/kb-editor";
   var AUTO_REFRESH_MS = 3 * 60 * 1000;
 
+  var App = window.NowPayApp;
   /* Pristine copy of the data that ships inside index.html (fallback + safety net). */
   var EMBEDDED = JSON.parse(JSON.stringify(window.__NOWPAY_DATA__ || {}));
 
-  var S = { client:null, session:null, rows:{}, started:false, readOnly:false, editorOpen:false, lastLoad:0, loading:false };
+  var S = { rows:{}, loaded:false, loading:false, lastLoad:0, token:null, tokenExp:0, pinPromise:null, editorOpen:false, lockTimer:null };
 
   var GROUP_LABELS = {
     topics:"المواضيع (صفحات الموقع)", kb_faqs_full:"بنك الأسئلة الشائعة", kb_faqs:"الأسئلة الشائعة (نسخة قديمة)",
@@ -25,7 +33,7 @@
     banks:"تنسيقات البنوك", channels:"قنوات التواصل", validation_policy:"سياسة التحقق", scripts:"سكريبتات المكالمات",
     revisit_plan:"خطة إعادة المراجعة", actions:"الإجراءات (الكل - قديم)", actions_all:"الإجراءات (الكل)",
     actions_increase_max_balance:"إجراءات: زيادة الحد الأقصى للرصيد", actions_block:"إجراءات: الحظر",
-    actions_deposit:"إجراءات: الإيداع", actions_update_data:"إجراءات: تحديث البيانات"
+    actions_deposit:"إجراءات: الإيداع", actions_update_data:"إجراءات: تحديث البيانات", kb_meta:"التصنيفات المضافة"
   };
   var GROUP_ORDER = ["topics","kb_faqs_full","fees_5m","fees_10m","sla","banks","channels","validation_policy","actions_all",
     "actions_increase_max_balance","actions_block","actions_deposit","actions_update_data","companies","scripts","revisit_plan","actions","kb_faqs"];
@@ -45,6 +53,18 @@
   var ADDABLE = ["overview","list","steps","notes","validation","faq","statuses","videos","link_cards","related"];
   var DEFAULT_SEC_CAT = { overview:"overview", list:"business_rules", steps:"agent_actions", notes:"notes", validation:"validation",
     faq:"faqs", statuses:"business_rules", videos:"videos", link_cards:"ops_tool", table_ref:"ticket_info" };
+  var STRING_ITEM_TYPES = ["list","steps","notes","validation","videos"];
+  var HAS_TITLE = ["list","steps","notes","validation","faq","statuses","link_cards","table_ref"];
+  /* field definitions for ONE item of each item-based section type (k = null means the item itself is a string) */
+  var ITEM_DEFS = {
+    list:[{ k:null, label:"النص", long:true }], steps:[{ k:null, label:"النص", long:true }],
+    notes:[{ k:null, label:"النص", long:true }], validation:[{ k:null, label:"النص", long:true }],
+    videos:[{ k:null, label:"رابط الفيديو", ltr:true, url:true }],
+    faq:[{ k:"q", label:"السؤال" }, { k:"a", label:"الإجابة", long:true }, { k:"video", label:"رابط فيديو (اختياري)", ltr:true, url:true, nullable:true }],
+    statuses:[{ k:"name", label:"الاسم" }, { k:"desc", label:"الوصف", long:true }],
+    link_cards:[{ k:"name", label:"الاسم" }, { k:"url", label:"الرابط", ltr:true, url:true, required:true }, { k:"purpose", label:"الغرض", long:true, optional:true },
+      { k:"uses", label:"يُستخدم من أجل (سطر لكل بند)", list:true, optional:true }]
+  };
 
   /* ---------------- tiny helpers ---------------- */
   function h(tag, attrs){
@@ -61,7 +81,6 @@
     for(var i = 2; i < arguments.length; i++) add(e, arguments[i]);
     return e;
   }
-  /* add(parent, child, child, ...) — children may be nodes, strings, arrays or null */
   function add(parent){
     for(var i = 1; i < arguments.length; i++){
       var c = arguments[i];
@@ -84,6 +103,8 @@
   function isArr(x){ return Array.isArray(x); }
   function isObj(x){ return x && typeof x === "object" && !Array.isArray(x); }
   function trunc(s, n){ s = String(s == null ? "" : s).replace(/\s+/g, " "); return s.length > n ? s.slice(0, n) + "…" : s; }
+  function D(){ return App.getData(); }
+  function isHttp(u){ return /^https?:\/\/\S+$/i.test(String(u || "").trim()); }
 
   /* ---------------- toasts ---------------- */
   var toastBox = null;
@@ -94,81 +115,22 @@
     setTimeout(function(){ if(t.parentNode) t.parentNode.removeChild(t); }, ms || 4200);
   }
 
-  /* ---------------- gate (login / loading / error) ---------------- */
-  var gate = null;
-  function ensureGate(){
-    if(gate) return gate;
-    gate = h("div", {class:"kb-gate", id:"kb-gate", role:"dialog", "aria-modal":"true"});
-    document.body.appendChild(gate);
-    return gate;
-  }
-  function gateShell(){
-    var g = ensureGate();
-    g.hidden = false; g.innerHTML = "";
-    var card = h("div", {class:"kb-gate-card"},
-      h("div", {class:"kb-gate-logo", text:"NP"}),
-      h("h1", {class:"kb-gate-title", text:"بوابة معرفة NowPay"}));
-    g.appendChild(card);
-    return card;
-  }
-  function gateHide(){ if(gate) gate.hidden = true; }
-  function gateLoading(msg){
-    var c = gateShell();
-    add(c, h("p", {class:"kb-gate-sub", text:"خدمة العملاء الداخلية"}), h("div", {class:"kb-spinner"}), h("p", {class:"kb-gate-msg", text:msg || "جاري التحميل…"}));
-  }
-  function gateError(msg, buttons){
-    var c = gateShell();
-    add(c, h("p", {class:"kb-gate-msg err", text:msg}), h("div", {class:"kb-gate-actions"}, buttons || []));
-  }
-  function gateLogin(message, kind){
-    var c = gateShell();
-    var email = h("input", {class:"kb-input", type:"email", autocomplete:"username", dir:"ltr", required:"", placeholder:"name@company.com"});
-    var pass = h("input", {class:"kb-input", type:"password", autocomplete:"current-password", dir:"ltr", required:"", placeholder:"••••••••"});
-    var msg = h("p", {class:"kb-gate-msg " + (kind || "err"), text:message || ""});
-    msg.hidden = !message;
-    var btn = h("button", {class:"kb-btn block", type:"submit", text:"تسجيل الدخول"});
-    var form = h("form", {novalidate:""},
-      h("label", {class:"kb-field"}, h("span", {text:"البريد الإلكتروني"}), email),
-      h("label", {class:"kb-field"}, h("span", {text:"كلمة المرور"}), pass),
-      msg, btn);
-    var busy = false;
-    form.addEventListener("submit", function(ev){
-      ev.preventDefault();
-      if(busy) return;
-      var em = email.value.trim(), pw = pass.value;
-      if(!em || !pw){ msg.hidden = false; msg.className = "kb-gate-msg err"; msg.textContent = "من فضلك أدخل البريد الإلكتروني وكلمة المرور."; return; }
-      busy = true; btn.disabled = true; btn.textContent = "جاري تسجيل الدخول…"; msg.hidden = true;
-      S.client.auth.signInWithPassword({ email:em, password:pw }).then(function(res){
-        if(res.error) throw res.error;
-        S.session = res.data.session;
-        return onAuthenticated();
-      }).catch(function(err){
-        busy = false; btn.disabled = false; btn.textContent = "تسجيل الدخول";
-        msg.hidden = false; msg.className = "kb-gate-msg err"; msg.textContent = authErrorText(err);
+  /* =========================================================
+     Reading (public, read-only)
+     ========================================================= */
+  function restGet(query){
+    return fetch(SUPABASE_URL + "/rest/v1/" + TABLE + "?" + query, { headers:{ apikey:SUPABASE_KEY, Accept:"application/json" }, cache:"no-store" })
+      .then(function(r){
+        if(!r.ok) throw new Error("HTTP " + r.status);
+        return r.json();
       });
-    });
-    add(c, h("p", {class:"kb-gate-sub", text:"سجّل الدخول للوصول إلى دليل خدمة العملاء"}), form);
-    setTimeout(function(){ email.focus(); }, 30);
   }
-  function authErrorText(err){
-    var m = String((err && err.message) || err || "");
-    if(/invalid login credentials|invalid.*credentials/i.test(m)) return "البريد الإلكتروني أو كلمة المرور غير صحيحة.";
-    if(/email not confirmed/i.test(m)) return "لم يتم تأكيد هذا البريد الإلكتروني بعد.";
-    if(err && (err.status === 429 || /rate limit|too many/i.test(m))) return "محاولات كثيرة. انتظر قليلاً ثم حاول مرة أخرى.";
-    if(/failed to fetch|network|load failed|retryable/i.test(m) || (err && err.name === "AuthRetryableFetchError")) return "تعذر الاتصال بالخادم. تحقق من الإنترنت وحاول مرة أخرى.";
-    return "تعذر تسجيل الدخول: " + m;
-  }
-  function isAuthError(err){
-    if(!err) return false;
-    var m = String(err.message || "");
-    return err.status === 401 || err.code === "PGRST301" || err.code === "PGRST303" || /jwt|token.*expired|not authenticated/i.test(m);
-  }
-
-  /* ---------------- data loading ---------------- */
-  function fetchRows(){
-    return S.client.from(TABLE).select("id,content,updated_at").then(function(r){
-      if(r.error) throw r.error;
-      return r.data || [];
+  function fetchRows(){ return restGet("select=id,content,updated_at"); }
+  function refetch(gid){
+    return restGet("select=id,content,updated_at&id=eq." + encodeURIComponent(gid)).then(function(rows){
+      var r = rows && rows[0];
+      if(r) S.rows[gid] = { content:r.content, updated_at:r.updated_at };
+      return r || null;
     });
   }
   function buildData(rows){
@@ -183,231 +145,211 @@
         if(ok) d[k] = c; else warns.push(k);
       } else if(c !== null && c !== undefined){ d[k] = c; }
     });
-    Object.keys(EMBEDDED).forEach(function(k){ if(!S.rows[k]) warns.push(k + " (غير موجود في Supabase)"); });
     return { data:d, warns:warns };
   }
-  function applyData(d){
-    window.NowPayApp.setData(d);
-    if(!S.started){ S.started = true; window.NowPayApp.start(); } else window.NowPayApp.rebuild();
-  }
-  function loadAndShow(silent){
+  /* Load the latest data. Never blocks the page: the embedded copy is already on screen. */
+  function loadLatest(silent){
     if(S.loading) return Promise.resolve();
     S.loading = true;
-    if(!silent) gateLoading("جاري تحميل المعرفة…");
     return fetchRows().then(function(rows){
       S.loading = false;
-      if(!rows.length) throw Object.assign(new Error("empty"), { empty:true });
+      S.loaded = true; S.lastLoad = Date.now();
+      setBanner(null);
       var b = buildData(rows);
-      applyData(b.data);
-      S.lastLoad = Date.now();
-      S.readOnly = false;
-      gateHide();
-      mountUserBar();
-      if(b.warns.length) toast("تنبيه: تم استخدام النسخة المدمجة لـ: " + b.warns.join("، "), "err", 8000);
-      else if(silent) toast("تم تحديث البيانات", "ok", 2000);
+      if(!deepEq(b.data, D())){ App.setData(b.data); App.rebuild(); }
+      if(b.warns.length && !silent) toast("تنبيه: تم استخدام النسخة المدمجة لـ: " + b.warns.join("، "), "err", 7000);
     }).catch(function(err){
       S.loading = false;
-      if(isAuthError(err)){ return signOutSilently().then(function(){ gateLogin("انتهت الجلسة. سجّل الدخول مرة أخرى.", "warn"); }); }
-      if(silent){ toast("تعذر تحديث البيانات: " + (err.message || err), "err"); return; }
-      var txt = err.empty
-        ? "لم يتم العثور على بيانات في Supabase (الجدول فارغ أو لا توجد صلاحية قراءة لهذا الحساب)."
-        : "تعذر تحميل البيانات من Supabase: " + (err.message || err);
-      gateError(txt, [
-        h("button", {class:"kb-btn", type:"button", text:"إعادة المحاولة", onclick:function(){ loadAndShow(false); }}),
-        h("button", {class:"kb-btn ghost", type:"button", text:"عرض النسخة المدمجة (قراءة فقط)", onclick:openReadOnly}),
-        h("button", {class:"kb-btn ghost", type:"button", text:"تسجيل الخروج", onclick:doLogout})
-      ]);
+      setBanner("تعذر الاتصال بالخادم، يتم عرض آخر نسخة متاحة. التعديل غير متاح مؤقتاً.");
+      if(silent === false) toast("تعذر تحديث البيانات: " + (err.message || err), "err");
     });
   }
-  function openReadOnly(){
-    S.readOnly = true;
-    applyData(clone(EMBEDDED));
-    gateHide();
-    mountUserBar();
-  }
-
-  /* ---------------- session handling ---------------- */
-  function signOutSilently(){
-    return S.client.auth.signOut().catch(function(){}).then(function(){ S.session = null; });
-  }
-  function doLogout(){
-    S.client.auth.signOut().catch(function(){}).then(function(){ window.location.reload(); });
-  }
-  function onAuthenticated(){ return loadAndShow(false); }
-  function ensureSession(){
-    return S.client.auth.getSession().then(function(r){
-      if(r.data && r.data.session) return r.data.session;
-      return S.client.auth.refreshSession().then(function(x){ return x.data && x.data.session ? x.data.session : null; });
-    });
-  }
-
-  /* ---------------- header user bar ---------------- */
-  var bar = null, editBtn = null;
-  function mountUserBar(){
-    if(bar && bar.parentNode) bar.parentNode.removeChild(bar);
-    var anchor = document.querySelector(".topbar-inner .notif-bell-wrap");
-    var host = document.querySelector(".topbar-inner");
-    if(!host) return;
-    var email = (S.session && S.session.user && S.session.user.email) || "";
-    editBtn = h("button", {class:"kb-edit-btn", type:"button", title:"إضافة وتعديل المعرفة", onclick:openEditor, disabled:S.readOnly},
-      "✏️ ", h("span", {class:"kb-lbl", text:"تحرير"}));
-    var refresh = h("button", {type:"button", title:"تحديث البيانات", "aria-label":"تحديث البيانات", text:"⟳",
-      onclick:function(){ if(S.readOnly) { loadAndShow(false); } else loadAndShow(true); }});
-    var out = h("button", {type:"button", title:"تسجيل الخروج", onclick:doLogout}, "⎋ ", h("span", {class:"kb-lbl", text:"خروج"}));
-    bar = h("div", {class:"kb-userbar"}, email ? h("span", {class:"kb-user", title:email, text:email}) : null,
-      S.readOnly ? null : editBtn, refresh, out);
-    if(anchor) host.insertBefore(bar, anchor); else host.appendChild(bar);
+  function setBanner(msg){
     var old = document.getElementById("kb-banner");
     if(old) old.parentNode.removeChild(old);
-    if(S.readOnly){
-      var b = h("div", {class:"kb-banner", id:"kb-banner", text:"وضع القراءة فقط: يتم عرض النسخة المدمجة لأن الاتصال بـ Supabase غير متاح. التعديلات معطّلة."});
-      var topbar = document.querySelector(".topbar");
-      if(topbar && topbar.parentNode) topbar.parentNode.insertBefore(b, topbar.nextSibling);
-    }
+    if(!msg) return;
+    var b = h("div", {class:"kb-banner", id:"kb-banner", role:"status", text:msg});
+    var topbar = document.querySelector(".topbar");
+    if(topbar && topbar.parentNode) topbar.parentNode.insertBefore(b, topbar.nextSibling);
   }
 
   /* =========================================================
-     Saving (optimistic concurrency, row/topic level merge)
+     PIN prompt + session token (memory only)
+     ========================================================= */
+  function callFn(body){
+    return fetch(FN_URL, { method:"POST", headers:{ "Content-Type":"application/json", apikey:SUPABASE_KEY }, body:JSON.stringify(body) })
+      .then(function(r){ return r.json().catch(function(){ return {}; }).then(function(j){ return { status:r.status, body:j || {} }; }); });
+  }
+  function hasToken(){ return !!S.token && Date.now() < S.tokenExp - 3000; }
+  function setToken(tok, secs){
+    S.token = tok; S.tokenExp = tok ? Date.now() + secs * 1000 : 0;
+    clearTimeout(S.lockTimer);
+    if(tok) S.lockTimer = setTimeout(function(){ S.token = null; updateLockUi(); }, Math.max(1000, secs * 1000 - 2000));
+    updateLockUi();
+  }
+  function requirePin(){
+    if(hasToken()) return Promise.resolve();
+    return pinDialog();
+  }
+  /* run fn after the PIN has been accepted (no PIN needed again while the 30-minute session is open) */
+  function unlockThen(fn){
+    requirePin().then(function(){ return fn(); }, function(e){ if(e && !e.cancelled) toast(String(e.message || e), "err"); });
+  }
+  function fmtWait(s){
+    s = Math.max(0, Math.ceil(s));
+    return s >= 60 ? Math.ceil(s / 60) + " دقيقة" : s + " ثانية";
+  }
+  function pinDialog(){
+    if(S.pinPromise) return S.pinPromise;
+    S.pinPromise = new Promise(function(resolve, reject){
+      var input = h("input", {class:"kb-pin-input", type:"password", inputmode:"numeric", pattern:"[0-9]*", autocomplete:"off",
+        maxlength:"8", dir:"ltr", "aria-label":"رمز التعديل", placeholder:"••••••", id:"kb-pin-input"});
+      var msg = h("p", {class:"kb-pin-msg", role:"alert", hidden:true});
+      var okBtn = h("button", {class:"kb-btn", type:"submit", text:"تأكيد"});
+      var cancel = h("button", {class:"kb-btn ghost", type:"button", text:"إلغاء"});
+      var form = h("form", {novalidate:"", autocomplete:"off"}, input, msg, h("div", {class:"kb-pin-actions"}, okBtn, cancel));
+      var box = h("div", {class:"kb-pin-box", role:"dialog", "aria-modal":"true", "aria-labelledby":"kb-pin-title"},
+        h("div", {class:"kb-pin-icon", text:"🔒"}),
+        h("h2", {id:"kb-pin-title", text:"رمز التعديل"}),
+        h("p", {class:"kb-note", text:"أدخل رمز التعديل (أرقام فقط) للمتابعة. عرض المحتوى متاح للجميع بدون رمز."}),
+        form);
+      var overlay = h("div", {class:"kb-pin-overlay"}, box);
+      var busy = false, waitTimer = null;
+      function done(){ clearInterval(waitTimer); document.removeEventListener("keydown", onKey, true); overlay.remove(); S.pinPromise = null; }
+      function say(text, kind){ msg.hidden = !text; msg.textContent = text || ""; msg.className = "kb-pin-msg " + (kind || "err"); }
+      function onKey(e){ if(e.key === "Escape"){ e.stopPropagation(); done(); reject(Object.assign(new Error("cancelled"), { cancelled:true })); } }
+      function lockFor(secs){
+        var until = Date.now() + secs * 1000;
+        input.disabled = true; okBtn.disabled = true;
+        function tick(){
+          var left = (until - Date.now()) / 1000;
+          if(left <= 0){ clearInterval(waitTimer); input.disabled = false; okBtn.disabled = false; say("", ""); input.focus(); return; }
+          say("محاولات كثيرة. حاول مرة أخرى بعد " + fmtWait(left) + ".", "warn");
+        }
+        tick(); clearInterval(waitTimer); waitTimer = setInterval(tick, 1000);
+      }
+      input.addEventListener("input", function(){ var c = input.value.replace(/\D+/g, ""); if(c !== input.value) input.value = c; });
+      cancel.addEventListener("click", function(){ done(); reject(Object.assign(new Error("cancelled"), { cancelled:true })); });
+      form.addEventListener("submit", function(ev){
+        ev.preventDefault();
+        if(busy) return;
+        var pin = input.value.trim();
+        if(!/^\d{4,8}$/.test(pin)){ say("أدخل رمزاً مكوّناً من 4 إلى 8 أرقام.", "err"); input.focus(); return; }
+        busy = true; okBtn.disabled = true; okBtn.textContent = "جاري التحقق…"; say("", "");
+        callFn({ action:"verify", pin:pin }).then(function(res){
+          busy = false; okBtn.disabled = false; okBtn.textContent = "تأكيد";
+          var b = res.body;
+          if(res.status === 200 && b.ok && b.token){ setToken(b.token, b.expires_in || 1800); done(); resolve(); return; }
+          input.value = "";
+          if(b.error === "bad_pin"){ say("الرمز غير صحيح. المحاولات المتبقية: " + b.attempts_left, "err"); input.focus(); }
+          else if(b.error === "rate_limited"){ lockFor(b.retry_after || 60); }
+          else if(b.error === "not_configured"){ say("التعديل غير مفعّل بعد على الخادم. تواصل مع مسؤول النظام.", "err"); }
+          else if(b.error === "bad_format"){ say("أدخل رمزاً مكوّناً من 4 إلى 8 أرقام.", "err"); }
+          else { say("تعذر التحقق الآن. حاول مرة أخرى بعد قليل.", "err"); }
+        }).catch(function(){
+          busy = false; okBtn.disabled = false; okBtn.textContent = "تأكيد";
+          say("تعذر الاتصال بالخادم. تحقق من الإنترنت وحاول مرة أخرى.", "err");
+        });
+      });
+      document.addEventListener("keydown", onKey, true);
+      document.body.appendChild(overlay);
+      setTimeout(function(){ input.focus(); }, 30);
+    });
+    return S.pinPromise;
+  }
+
+  /* ---------------- top bar: manage + lock ---------------- */
+  var manageBtn = null, lockBtn = null;
+  function mountTopbar(){
+    var host = document.querySelector(".topbar-inner");
+    if(!host || document.getElementById("kb-userbar")) return;
+    var anchor = host.querySelector(".notif-bell-wrap");
+    manageBtn = h("button", {class:"kb-edit-btn", id:"kb-manage-btn", type:"button", title:"إدارة كل بيانات الموقع (يتطلب رمز التعديل)",
+      onclick:function(){ unlockThen(function(){ openEditor(); }); }}, "✏️ ", h("span", {class:"kb-lbl", text:"إدارة البيانات"}));
+    lockBtn = h("button", {id:"kb-lock-btn", type:"button", hidden:true, title:"إنهاء جلسة التعديل الآن",
+      onclick:function(){ setToken(null, 0); toast("تم قفل التعديل.", "ok", 1800); }}, "🔓 ", h("span", {class:"kb-lbl", text:"قفل التعديل"}));
+    var bar = h("div", {class:"kb-userbar", id:"kb-userbar"}, manageBtn, lockBtn);
+    if(anchor) host.insertBefore(bar, anchor); else host.appendChild(bar);
+    updateLockUi();
+  }
+  function updateLockUi(){
+    if(lockBtn) lockBtn.hidden = !hasToken();
+    document.body.classList.toggle("kb-unlocked", hasToken());
+  }
+
+  /* =========================================================
+     Saving: Edge Function only (optimistic concurrency + automatic backup on the server)
      ========================================================= */
   function conflict(msg){ var e = new Error(msg); e.conflict = true; return e; }
   function currentContent(gid){
     if(S.rows[gid]) return clone(S.rows[gid].content);
-    return clone(window.NowPayApp.getData()[gid]);
+    var d = D()[gid];
+    if(d === undefined && gid === "kb_meta") return { categories:[] };
+    return clone(d);
+  }
+  var SERVER_MSG = {
+    rows_cannot_be_removed:"غير مسموح بحذف محتوى موجود.", topics_cannot_be_removed:"غير مسموح بحذف موضوع موجود.",
+    sections_cannot_be_removed:"غير مسموح بحذف قسم موجود.", categories_cannot_be_removed:"غير مسموح بحذف تصنيف موجود.",
+    invalid_link:"يوجد رابط غير صالح (يجب أن يبدأ بـ http:// أو https://).", string_too_long:"أحد النصوص طويل جداً.",
+    content_too_large:"حجم البيانات كبير جداً.", unknown_group:"مجموعة بيانات غير معروفة.", topic_id_duplicate:"معرّف الموضوع مستخدم بالفعل.",
+    meta_category_duplicate:"اسم التصنيف مستخدم بالفعل."
+  };
+  function serverError(res){
+    var b = res.body || {}, d = String(b.detail || "").split(":")[0];
+    if(SERVER_MSG[d]) return new Error(SERVER_MSG[d]);
+    if(res.status === 429) return new Error("محاولات كثيرة. حاول لاحقاً.");
+    if(res.status === 413) return new Error("حجم البيانات كبير جداً.");
+    if(res.status === 503) return new Error("التعديل غير مفعّل بعد على الخادم.");
+    return new Error("رفض الخادم الحفظ" + (b.detail || b.error ? " (" + (b.detail || b.error) + ")" : "") + ".");
   }
   /* mutate(freshContent) -> newContent ; throws conflict() when someone else changed the same item. */
-  function saveGroup(gid, mutate){
+  function saveGroup(gid, mutate, label){
     var tries = 0;
     function attempt(){
       tries++;
-      var cur = S.rows[gid];
-      var next;
+      if(tries > 5) return Promise.reject(conflict("تم تعديل هذه البيانات من شخص آخر أثناء الحفظ. حدّث الصفحة وحاول مرة أخرى."));
+      var cur = S.rows[gid], next;
       try { next = mutate(currentContent(gid)); } catch(e){ return Promise.reject(e); }
-      var now = new Date().toISOString();
-      var req;
-      if(cur){
-        req = S.client.from(TABLE).update({ content:next, updated_at:now }).eq("id", gid).eq("updated_at", cur.updated_at).select("id,updated_at");
-      } else {
-        req = S.client.from(TABLE).insert({ id:gid, content:next, updated_at:now }).select("id,updated_at");
-      }
-      return req.then(function(r){
-        if(r.error){
-          if(r.error.code === "23505" && tries < 4) return refetch(gid).then(attempt);
-          throw r.error;
+      return callFn({ action:"save", token:S.token, group:gid, content:next, expected_updated_at:cur ? cur.updated_at : null, label:label || "edit" }).then(function(res){
+        var b = res.body || {};
+        if(res.status === 200 && b.ok){
+          S.rows[gid] = { content:next, updated_at:b.updated_at };
+          var d = D(); d[gid] = next; App.setData(d); App.rebuild();
+          S.lastLoad = Date.now();
+          return next;
         }
-        if(!r.data || !r.data.length){
-          /* 0 rows: either someone changed the row first, or RLS blocked the update. */
-          return refetch(gid).then(function(fresh){
-            if(!fresh) throw new Error("لا توجد صلاحية لتعديل هذه البيانات.");
-            if(cur && fresh.updated_at === cur.updated_at) throw new Error("لم يتم الحفظ: لا توجد صلاحية تعديل لهذا الحساب.");
-            if(tries >= 4) throw conflict("تم تعديل هذه المجموعة من شخص آخر أثناء الحفظ. حدّث الصفحة وحاول مرة أخرى.");
-            return attempt();
-          });
+        if(res.status === 401){            /* token missing / expired -> ask for the PIN again, then retry (the open form is kept) */
+          setToken(null, 0);
+          return pinDialog().then(attempt);
         }
-        var saved = r.data[0];
-        S.rows[gid] = { content:next, updated_at:saved.updated_at || now };
-        var d = window.NowPayApp.getData();
-        d[gid] = next;
-        window.NowPayApp.setData(d);
-        window.NowPayApp.rebuild();
-        S.lastLoad = Date.now();
-        return next;
+        if(res.status === 409){            /* someone saved first -> fetch the newest version and re-apply this edit on top of it */
+          return refetch(gid).then(attempt);
+        }
+        throw serverError(res);
       });
     }
-    function withAuthRetry(){
-      return attempt().catch(function(err){
-        if(isAuthError(err)){
-          return ensureSession().then(function(sess){
-            if(!sess){ gateLogin("انتهت الجلسة. سجّل الدخول ثم أعد المحاولة (لن تضيع تعديلاتك المفتوحة).", "warn"); throw new Error("انتهت الجلسة. سجّل الدخول ثم اضغط حفظ مرة أخرى."); }
-            S.session = sess;
-            return attempt();
-          });
-        }
-        throw err;
-      });
-    }
-    return withAuthRetry();
-  }
-  function refetch(gid){
-    return S.client.from(TABLE).select("id,content,updated_at").eq("id", gid).maybeSingle().then(function(r){
-      if(r.error) throw r.error;
-      if(r.data) S.rows[gid] = { content:r.data.content, updated_at:r.data.updated_at };
-      return r.data || null;
-    });
+    if(!hasToken()) return pinDialog().then(attempt);
+    return attempt();
   }
   function friendlyError(err){
     var m = String((err && err.message) || err);
-    if(/failed to fetch|network/i.test(m)) return "تعذر الاتصال بالخادم. لم يتم الحفظ — تحقق من الإنترنت وحاول مرة أخرى.";
-    if(err && err.code === "42501") return "لا توجد صلاحية لحفظ هذه البيانات (RLS).";
+    if(/failed to fetch|network|load failed/i.test(m)) return "تعذر الاتصال بالخادم. لم يتم الحفظ — تحقق من الإنترنت وحاول مرة أخرى.";
+    if(err && err.cancelled) return "تم إلغاء إدخال الرمز. لم يتم الحفظ.";
     return m;
   }
-
-  /* =========================================================
-     Editor
-     ========================================================= */
-  var ed = null, edSide = null, edPane = null, activeGroup = null;
-
-  function groupKeys(){
-    var d = window.NowPayApp.getData();
-    var keys = GROUP_ORDER.filter(function(k){ return d[k] !== undefined; });
-    Object.keys(d).forEach(function(k){ if(keys.indexOf(k) < 0) keys.push(k); });
-    return keys;
+  function mutateTopic(topicId, fn, label){
+    return saveGroup("topics", function(content){
+      var i = -1;
+      for(var j = 0; j < content.length; j++){ if(content[j].id === topicId){ i = j; break; } }
+      if(i < 0) throw conflict("لم يتم العثور على الموضوع. حدّث الصفحة وحاول مرة أخرى.");
+      fn(content[i], content);
+      return content;
+    }, label);
   }
-  function displayedGroups(){
-    var shown = { topics:true }, d = window.NowPayApp.getData();
-    (d.topics || []).forEach(function(t){ (t.sections || []).forEach(function(s){ if(s.type === "table_ref" && s.ref) shown[s.ref] = true; }); });
-    return shown;
-  }
-  function openEditor(){
-    if(S.readOnly) return;
-    if(!ed){
-      edSide = h("div", {class:"kb-ed-side"});
-      edPane = h("div", {class:"kb-ed-pane"});
-      ed = h("div", {class:"kb-editor", id:"kb-editor", hidden:true},
-        h("div", {class:"kb-ed-box", role:"dialog", "aria-modal":"true", "aria-label":"تحرير المعرفة"},
-          h("div", {class:"kb-ed-head"},
-            h("h2", {text:"✏️ تحرير المعرفة"}),
-            h("button", {class:"kb-btn", type:"button", text:"⬇ نسخة احتياطية JSON", onclick:exportBackup}),
-            h("button", {class:"kb-btn", type:"button", text:"✕ إغلاق", onclick:closeEditor})),
-          h("div", {class:"kb-ed-main"}, edSide, edPane)));
-      document.body.appendChild(ed);
-      document.addEventListener("keydown", function(e){ if(e.key === "Escape" && S.editorOpen && !document.querySelector(".kb-form-overlay")) closeEditor(); });
-    }
-    ed.hidden = false; S.editorOpen = true;
-    document.body.style.overflow = "hidden";
-    renderSide();
-    if(!activeGroup) activeGroup = "topics";
-    openGroup(activeGroup);
-  }
-  function closeEditor(){
-    if(!ed) return;
-    ed.hidden = true; S.editorOpen = false; document.body.style.overflow = "";
-  }
-  function renderSide(){
-    edSide.innerHTML = "";
-    var d = window.NowPayApp.getData(), shown = displayedGroups();
-    groupKeys().forEach(function(k){
-      var v = d[k];
-      var n = isArr(v) ? v.length : "";
-      edSide.appendChild(h("button", {class:"kb-ed-group" + (k === activeGroup ? " active" : ""), type:"button", onclick:function(){ openGroup(k); }},
-        h("span", {text:GROUP_LABELS[k] || k}),
-        shown[k] ? null : h("span", {class:"tag", title:"هذه المجموعة محفوظة لكنها غير معروضة حالياً في أي صفحة من الموقع", text:"غير معروضة"}),
-        h("span", {class:"n", text:String(n)})));
-    });
-  }
-  function openGroup(gid){
-    activeGroup = gid; renderSide();
-    var v = window.NowPayApp.getData()[gid];
-    edPane.innerHTML = ""; edPane.scrollTop = 0;
-    if(gid === "topics") topicsView();
-    else if(isArr(v) && v.every(isObj)) rowsView(gid);
-    else jsonView(gid);
-  }
-  function exportBackup(){
-    var d = window.NowPayApp.getData();
-    var blob = new Blob([JSON.stringify({ exported_at:new Date().toISOString(), source:"supabase:" + TABLE, groups:d }, null, 2)], { type:"application/json" });
-    var a = h("a", { href:URL.createObjectURL(blob), download:"nowpay-kb-backup-" + new Date().toISOString().slice(0, 10) + ".json" });
-    document.body.appendChild(a); a.click();
-    setTimeout(function(){ URL.revokeObjectURL(a.href); a.remove(); }, 500);
+  function findTopic(id){
+    var all = D().topics || [];
+    for(var i = 0; i < all.length; i++) if(all[i].id === id) return all[i];
+    return null;
   }
 
   /* ---------- generic modal form ---------- */
@@ -443,13 +385,374 @@
     overlay.appendChild(h("div", {class:"kb-form", role:"dialog", "aria-modal":"true"},
       h("div", {class:"kb-form-head", text:title}), h("div", {class:"kb-form-body"}, body), err, foot));
     document.body.appendChild(overlay);
+    var first = overlay.querySelector("input:not([disabled]), textarea, select");
+    if(first) setTimeout(function(){ try{ first.focus(); }catch(e){} }, 30);
     return { overlay:overlay, close:close };
   }
   function field(label, input, hint){
     return h("label", {class:"kb-field"}, h("span", {text:label}), input, hint ? h("div", {class:"kb-note", text:hint}) : null);
   }
+  function catSelect(current){
+    var sel = h("select", {class:"kb-select"});
+    var cats = App.meta.catList();
+    if(current && cats.indexOf(current) < 0) cats.push(current);
+    cats.forEach(function(c){ var o = h("option", {value:c, text:(App.meta.catIcon(c) || "") + " " + c}); if(c === current) o.selected = true; sel.appendChild(o); });
+    return sel;
+  }
+  function placementSelect(current){
+    var M = App.meta, sel = h("select", {class:"kb-select"});
+    M.SEC_CAT_ORDER.forEach(function(c){ var o = h("option", {value:c, text:M.SEC_CAT_LABEL[c]}); if(c === current) o.selected = true; sel.appendChild(o); });
+    return sel;
+  }
+  function afterTopicSaved(id){
+    setTimeout(function(){
+      var d = document.getElementById("topic-" + id);
+      if(d){ d.setAttribute("open", ""); d.scrollIntoView({ behavior:"smooth", block:"start" }); }
+    }, 60);
+  }
 
-  /* ---------- flat table groups ---------- */
+  /* =========================================================
+     Inline Edit / Add buttons (rendered next to every section and item for everyone)
+     ========================================================= */
+  function ib(label, title, fn, cls){
+    return h("button", {class:"kb-ib " + (cls || ""), type:"button", title:title, "aria-label":title + " — " + label,
+      onclick:function(ev){ ev.preventDefault(); ev.stopPropagation(); unlockThen(fn); }}, label);
+  }
+  function tools(cls){ return h("div", {class:"kb-tools " + (cls || "")}); }
+
+  App.hooks.topic = function(details, body, t){
+    var bar = tools("kb-topic-tools");
+    add(bar,
+      ib("✏️ تعديل الموضوع", "تعديل عنوان الموضوع وتصنيفه", function(){ topicForm(t.id); }),
+      ib("＋ إضافة قسم", "إضافة قسم جديد داخل هذا الموضوع", function(){ addSectionForm(t.id); }));
+    body.insertBefore(bar, body.firstChild);
+  };
+  App.hooks.category = function(heading, cat){
+    heading.appendChild(h("span", {class:"kb-tools kb-cat-tools"}, ib("＋ موضوع جديد", "إضافة موضوع جديد في هذا التصنيف", function(){ topicForm(null, cat); })));
+  };
+  App.hooks.page = function(main){
+    main.appendChild(h("div", {class:"kb-page-tools"},
+      ib("＋ إضافة فرع / تصنيف جديد", "إنشاء تصنيف جديد يظهر في القائمة الجانبية", function(){ categoryForm(); }, "big")));
+  };
+  App.hooks.sidebar = function(nav){
+    nav.appendChild(h("div", {class:"kb-side-tools"}, ib("＋ فرع جديد", "إنشاء تصنيف جديد", function(){ categoryForm(); }, "big")));
+  };
+
+  function itemNodes(sec, node){
+    var q = function(sel){ return Array.prototype.slice.call(node.querySelectorAll(sel)); };
+    switch(sec.type){
+      case "steps": return q(".step-cards > .step-card");
+      case "list": case "notes": return q("ul.bul-list > li");
+      case "validation": return q("ul.check-list > li");
+      case "statuses": return q(".status-grid > .status-card");
+      case "faq": return q(".faq-acc > .faq-item");
+      case "videos": return q(".video-row > a");
+      case "link_cards": return q(".channel-grid > .action-card");
+      default: return [];
+    }
+  }
+  function tableNodes(ref, node){
+    var q = function(sel){ return Array.prototype.slice.call(node.querySelectorAll(sel)); };
+    switch(ref){
+      case "fees_5m": case "fees_10m": case "companies": case "sla": case "banks": case "validation_policy": return q("tbody tr");
+      case "channels": return q(".channel-card");
+      case "scripts": return q(".script-card");
+      case "kb_faqs_full": return q(".faq-acc > .faq-item");
+      default: return ref && ref.indexOf("actions_") === 0 ? q(".action-grid > .action-card") : [];
+    }
+  }
+
+  App.hooks.section = function(node, t, sec){
+    var idx = t.sections.indexOf(sec);
+    var bar = tools("kb-sec-tools");
+    var type = sec.type;
+    /* ---- sections that show a shared data group (tables, cards, actions) ---- */
+    var ref = (type === "table_ref" || type.indexOf("actions_") === 0) ? sec.ref : null;
+    if(ref){
+      var rows = D()[ref];
+      var gl = GROUP_LABELS[ref] || ref;
+      if(type === "actions_validation" || type === "actions_steps" || type === "actions_chips"){
+        bar.appendChild(ib("✏️ تعديل بيانات الإجراءات", "هذا القسم مبني من جدول الإجراءات: تعديل «" + gl + "»", function(){ openEditor(ref); }));
+      } else {
+        bar.appendChild(ib("＋ إضافة صف", "إضافة صف جديد إلى «" + gl + "»", function(){ rowForm(ref, schemaOf(D()[ref] || []), -1); }));
+        if(idx >= 0 && HAS_TITLE.indexOf(type) >= 0) bar.appendChild(ib("✏️ تعديل القسم", "تعديل عنوان القسم ومكانه", function(){ sectionForm(t.id, idx); }));
+        var nodes = tableNodes(ref, node);
+        if(isArr(rows) && nodes.length === rows.length){
+          var isTable = nodes.length && nodes[0].tagName === "TR";
+          if(isTable){
+            var thr = node.querySelector("thead tr");
+            if(thr) thr.appendChild(h("th", {class:"kb-th-edit", "aria-label":"تعديل"}));
+          }
+          nodes.forEach(function(n, i){
+            var btn = ib("✏️", "تعديل هذا العنصر", function(){ rowForm(ref, schemaOf(D()[ref]), i); }, isTable ? "" : "abs");
+            if(isTable) n.appendChild(h("td", {class:"kb-td-edit"}, btn));
+            else { n.classList.add("kb-has-ib"); n.appendChild(btn); }
+          });
+        }
+      }
+      node.insertBefore(bar, node.firstChild);
+      return;
+    }
+    if(idx < 0) return;
+    /* ---- normal content sections ---- */
+    bar.appendChild(ib("✏️ تعديل القسم", "تعديل عنوان القسم ومكانه" + (type === "overview" ? " ونصه" : ""), function(){ sectionForm(t.id, idx); }));
+    if(ITEM_DEFS[type]) bar.appendChild(ib("＋ إضافة عنصر", "إضافة عنصر جديد إلى هذا القسم", function(){ itemForm(t.id, idx, -1); }));
+    node.insertBefore(bar, node.firstChild);
+    if(ITEM_DEFS[type]){
+      var nodes2 = itemNodes(sec, node);
+      if(nodes2.length === (sec.items || []).length){
+        nodes2.forEach(function(n, i){
+          var btn = ib("✏️", "تعديل هذا العنصر", function(){ itemForm(t.id, idx, i); }, type === "faq" || type === "statuses" || type === "link_cards" ? "abs" : "inline");
+          if(type === "videos") n.parentNode.insertBefore(btn, n.nextSibling);
+          else { n.classList.add("kb-has-ib"); n.appendChild(btn); }
+        });
+      }
+    }
+  };
+
+  /* =========================================================
+     Forms
+     ========================================================= */
+  function blankItem(type){
+    if(STRING_ITEM_TYPES.indexOf(type) >= 0) return "";
+    if(type === "faq") return { q:"", a:"", video:null };
+    if(type === "statuses") return { name:"", desc:"" };
+    return { name:"", url:"", purpose:"", uses:[] };
+  }
+  function itemInputs(type, base){
+    var defs = ITEM_DEFS[type], inputs = [], nodes = [];
+    defs.forEach(function(df){
+      var cur = df.k === null ? base : base[df.k];
+      if(df.list) cur = (cur || []).join("\n");
+      cur = cur === null || cur === undefined ? "" : String(cur);
+      var el = (df.long || df.list) ? h("textarea", {class:"kb-textarea", rows:df.list ? "3" : "4", value:cur, dir:df.ltr ? "ltr" : null})
+                                    : h("input", {class:"kb-input", type:"text", value:cur, dir:df.ltr ? "ltr" : null});
+      inputs.push(el); nodes.push(field(df.label, el));
+    });
+    function collect(strict){
+      var out = ITEM_DEFS[type][0].k === null ? "" : {};
+      for(var i = 0; i < defs.length; i++){
+        var df = defs[i], raw = inputs[i].value, v;
+        if(df.list) v = raw.split("\n").map(function(x){ return x.trim(); }).filter(Boolean);
+        else v = raw.replace(/\s+$/g, "");
+        if(df.url && String(raw).trim() !== "" && !isHttp(raw)) throw new Error("الرابط في «" + df.label + "» غير صالح. يجب أن يبدأ بـ http:// أو https://");
+        if(df.k === null){ out = v; }
+        else if(df.list){ out[df.k] = v; }
+        else if(df.url) out[df.k] = String(raw).trim() === "" ? (df.nullable ? null : "") : String(raw).trim();
+        else out[df.k] = v;
+      }
+      return out;
+    }
+    return { nodes:nodes, inputs:inputs, collect:collect };
+  }
+  function itemIsEmpty(type, it){
+    if(STRING_ITEM_TYPES.indexOf(type) >= 0) return !String(it || "").trim();
+    var df = ITEM_DEFS[type][0];
+    return !String(it[df.k] || "").trim();
+  }
+
+  /* ---- add / edit ONE item of a section ---- */
+  function itemForm(topicId, secIdx, itemIdx){
+    var t = findTopic(topicId);
+    if(!t || !t.sections[secIdx]) return toast("تعذر العثور على القسم. حدّث الصفحة.", "err");
+    var sec = t.sections[secIdx], type = sec.type, isNew = itemIdx < 0;
+    var base = isNew ? blankItem(type) : clone(sec.items[itemIdx]);
+    var ui = itemInputs(type, base);
+    var body = h("div", null, ui.nodes);
+    openForm((isNew ? "إضافة عنصر — " : "تعديل عنصر — ") + (SECTION_TYPES[type] || type) + (sec.title ? " · " + trunc(sec.title, 40) : ""), body, {
+      onSave:function(){
+        var next = ui.collect();
+        if(itemIsEmpty(type, next)) throw new Error("الحقل «" + ITEM_DEFS[type][0].label + "» مطلوب.");
+        if(type === "faq" && !String(next.a || "").trim()) throw new Error("الإجابة مطلوبة.");
+        if(type === "link_cards" && !isHttp(next.url)) throw new Error("الرابط مطلوب ويجب أن يبدأ بـ http:// أو https://");
+        if(!isNew && deepEq(next, base)) throw new Error("لم يتم تغيير أي شيء.");
+        return mutateTopic(topicId, function(topic){
+          var s = topic.sections[secIdx];
+          if(!s || s.type !== type || !isArr(s.items)) throw conflict("تم تغيير هذا القسم من شخص آخر. حدّث الصفحة وحاول مرة أخرى.");
+          if(isNew){ s.items.push(next); return; }
+          if(!deepEq(s.items[itemIdx], base)){
+            if(deepEq(s.items[itemIdx], next)) return;
+            throw conflict("تم تعديل هذا العنصر من شخص آخر. أغلق النافذة وحدّث الصفحة ثم أعد المحاولة.");
+          }
+          s.items[itemIdx] = next;
+        }, isNew ? "add-item" : "edit-item");
+      },
+      after:function(){ afterTopicSaved(topicId); }
+    });
+  }
+
+  /* ---- edit a section's own properties: title, placement, overview text, related ids ---- */
+  function sectionForm(topicId, secIdx){
+    var t = findTopic(topicId);
+    if(!t || !t.sections[secIdx]) return toast("تعذر العثور على القسم. حدّث الصفحة.", "err");
+    var M = App.meta, sec = t.sections[secIdx], type = sec.type, base = clone(sec);
+    var effCat = sec.cat || (M.TOPIC_CATMAP[t.id] || {})[secIdx];
+    var body = h("div"), titleIn = null, textIn = null, idsIn = null, placeSel = null;
+    if(HAS_TITLE.indexOf(type) >= 0){ titleIn = h("input", {class:"kb-input", type:"text", value:sec.title || "", placeholder:"عنوان القسم (اختياري)"}); body.appendChild(field("عنوان القسم", titleIn)); }
+    if(type === "overview"){ textIn = h("textarea", {class:"kb-textarea", rows:"7", value:sec.text || ""}); body.appendChild(field("النص", textIn)); }
+    if(type === "related"){
+      idsIn = h("input", {class:"kb-input", type:"text", dir:"ltr", value:(sec.items || []).join(", ")});
+      body.appendChild(field("معرّفات المواضيع (مفصولة بفاصلة)", idsIn, "المعرّفات المتاحة: " + D().topics.map(function(x){ return x.id; }).join(", ")));
+    }
+    if(type !== "related" && effCat !== "actions_ref" && !(type === "table_ref" && String(sec.ref).indexOf("actions_") === 0)){
+      placeSel = placementSelect(effCat);
+      body.appendChild(field("مكان ظهور القسم داخل الصفحة", placeSel));
+    }
+    if(!body.firstChild) body.appendChild(h("p", {class:"kb-note", text:"لا توجد خصائص قابلة للتعديل هنا. استخدم أزرار ✏️ بجانب كل عنصر."}));
+    openForm("تعديل القسم — " + (SECTION_TYPES[type] || type), body, {
+      onSave:function(){
+        var next = clone(sec);
+        if(titleIn){ next.title = titleIn.value.trim(); }
+        if(textIn){
+          next.text = textIn.value.replace(/\s+$/g, "");
+          if(!next.text.trim()) throw new Error("النص مطلوب.");
+        }
+        if(idsIn){
+          next.items = idsIn.value.split(",").map(function(x){ return x.trim(); }).filter(Boolean);
+          var known = {}; D().topics.forEach(function(x){ known[x.id] = true; });
+          next.items.forEach(function(id){ if(!known[id]) throw new Error("المعرّف غير موجود: " + id); });
+        }
+        if(placeSel && placeSel.value !== effCat) next.cat = placeSel.value;
+        else if(placeSel && sec.cat) next.cat = sec.cat;
+        if(deepEq(next, base)) throw new Error("لم يتم تغيير أي شيء.");
+        return mutateTopic(topicId, function(topic){
+          var s = topic.sections[secIdx];
+          if(!s || s.type !== type) throw conflict("تم تغيير هذا القسم من شخص آخر. حدّث الصفحة وحاول مرة أخرى.");
+          if(!deepEq(s, base) && !deepEq(s, next)) throw conflict("تم تعديل هذا القسم من شخص آخر. أغلق النافذة وحدّث الصفحة ثم أعد المحاولة.");
+          /* keep everything else in the section (e.g. items) exactly as it is on the server */
+          if(titleIn) s.title = next.title;
+          if(textIn) s.text = next.text;
+          if(idsIn) s.items = next.items;
+          if(next.cat) s.cat = next.cat;
+        }, "edit-section");
+      },
+      after:function(){ afterTopicSaved(topicId); }
+    });
+  }
+
+  /* ---- add a NEW section to a topic ---- */
+  function addSectionForm(topicId){
+    var t = findTopic(topicId);
+    if(!t) return toast("تعذر العثور على الموضوع. حدّث الصفحة.", "err");
+    var hasRelated = t.sections.some(function(s){ return s.type === "related"; });
+    var typeSel = h("select", {class:"kb-select"});
+    ADDABLE.forEach(function(k){ if(k === "related" && hasRelated) return; typeSel.appendChild(h("option", {value:k, text:SECTION_TYPES[k]})); });
+    var holder = h("div"), titleIn = null, placeSel = null, ui = null, linesIn = null, textIn = null, idsIn = null;
+    function draw(){
+      holder.innerHTML = ""; titleIn = placeSel = ui = linesIn = textIn = idsIn = null;
+      var type = typeSel.value;
+      if(HAS_TITLE.indexOf(type) >= 0){ titleIn = h("input", {class:"kb-input", type:"text", placeholder:"عنوان القسم (اختياري)"}); holder.appendChild(field("عنوان القسم", titleIn)); }
+      if(type === "overview"){ textIn = h("textarea", {class:"kb-textarea", rows:"6"}); holder.appendChild(field("النص", textIn)); }
+      else if(type === "related"){ idsIn = h("input", {class:"kb-input", type:"text", dir:"ltr"}); holder.appendChild(field("معرّفات المواضيع (مفصولة بفاصلة)", idsIn, "المعرّفات المتاحة: " + D().topics.map(function(x){ return x.id; }).join(", "))); }
+      else if(STRING_ITEM_TYPES.indexOf(type) >= 0){
+        linesIn = h("textarea", {class:"kb-textarea", rows:"6", dir:type === "videos" ? "ltr" : null});
+        holder.appendChild(field(type === "videos" ? "روابط الفيديو (رابط في كل سطر)" : "العناصر (عنصر في كل سطر)", linesIn, "يمكنك إضافة المزيد لاحقاً بزر «＋ إضافة عنصر» داخل القسم."));
+      } else { ui = itemInputs(type, blankItem(type)); holder.appendChild(h("div", {class:"kb-subitem"}, ui.nodes)); }
+      if(type !== "related"){ placeSel = placementSelect(DEFAULT_SEC_CAT[type]); holder.appendChild(field("مكان ظهور القسم داخل الصفحة", placeSel)); }
+    }
+    typeSel.addEventListener("change", draw); draw();
+    var body = h("div", null, field("نوع القسم", typeSel), holder);
+    openForm("إضافة قسم جديد — " + t.title, body, {
+      onSave:function(){
+        var type = typeSel.value, s = { type:type };
+        if(type === "overview"){ s.text = textIn.value.replace(/\s+$/g, ""); if(!s.text.trim()) throw new Error("النص مطلوب."); }
+        else if(type === "related"){
+          s.items = idsIn.value.split(",").map(function(x){ return x.trim(); }).filter(Boolean);
+          var known = {}; D().topics.forEach(function(x){ known[x.id] = true; });
+          if(!s.items.length) throw new Error("أدخل معرّف موضوع واحد على الأقل.");
+          s.items.forEach(function(id){ if(!known[id]) throw new Error("المعرّف غير موجود: " + id); });
+        } else if(STRING_ITEM_TYPES.indexOf(type) >= 0){
+          s.items = linesIn.value.split("\n").map(function(x){ return x.trim(); }).filter(Boolean);
+          if(!s.items.length) throw new Error("أدخل عنصراً واحداً على الأقل.");
+          if(type === "videos") s.items.forEach(function(u){ if(!isHttp(u)) throw new Error("رابط غير صالح: " + u); });
+        } else {
+          var it = ui.collect();
+          if(itemIsEmpty(type, it)) throw new Error("الحقل «" + ITEM_DEFS[type][0].label + "» مطلوب.");
+          if(type === "faq" && !String(it.a || "").trim()) throw new Error("الإجابة مطلوبة.");
+          if(type === "link_cards" && !isHttp(it.url)) throw new Error("الرابط مطلوب ويجب أن يبدأ بـ http:// أو https://");
+          s.items = [it];
+        }
+        if(titleIn && titleIn.value.trim()) s.title = titleIn.value.trim();
+        if(placeSel) s.cat = placeSel.value;
+        return mutateTopic(topicId, function(topic){ topic.sections.push(s); }, "add-section");   /* appended: existing sections keep their positions */
+      },
+      after:function(){ afterTopicSaved(topicId); }
+    });
+  }
+
+  /* ---- add / edit a topic (a "branch" of the tree) ---- */
+  function genId(){ return "topic-" + Date.now().toString(36) + Math.random().toString(36).slice(2, 5); }
+  function topicForm(topicId, presetCat){
+    var all = D().topics, isNew = !topicId;
+    var base = isNew ? null : clone(findTopic(topicId));
+    if(!isNew && !base) return toast("تعذر العثور على الموضوع. حدّث الصفحة.", "err");
+    var idIn = h("input", {class:"kb-input", type:"text", dir:"ltr", value:isNew ? "" : base.id, disabled:!isNew, placeholder:"اتركه فارغاً ليتم إنشاؤه تلقائياً (حروف إنجليزية صغيرة وأرقام و -)"});
+    var catSel = catSelect(isNew ? (presetCat || App.meta.CAT_ORDER[0]) : base.cat);
+    var iconIn = h("input", {class:"kb-input", type:"text", value:isNew ? "📄" : (base.icon || "")});
+    var titleIn = h("input", {class:"kb-input", type:"text", value:isNew ? "" : base.title});
+    var kwIn = h("textarea", {class:"kb-textarea", rows:"2", value:isNew ? "" : (base.keywords || "")});
+    var introIn = isNew ? h("textarea", {class:"kb-textarea", rows:"5", placeholder:"اختياري — يمكنك إضافة باقي الأقسام بعد الحفظ بزر «＋ إضافة قسم»"}) : null;
+    var body = h("div", null,
+      h("div", {class:"kb-grid2"}, field("معرّف الموضوع (id)", idIn, isNew ? "لا يمكن تغييره لاحقاً." : "ثابت ولا يمكن تغييره."), field("التصنيف", catSel),
+        field("العنوان", titleIn), field("الأيقونة (إيموجي)", iconIn)),
+      field("كلمات البحث (keywords)", kwIn, "كلمات إضافية تساعد البحث على إيجاد هذا الموضوع."),
+      introIn ? field("نظرة عامة عن الموضوع", introIn) : null);
+    openForm(isNew ? "موضوع جديد" : "تعديل الموضوع: " + base.title, body, {
+      onSave:function(){
+        var id = isNew ? (idIn.value.trim() || genId()) : base.id, title = titleIn.value.trim();
+        if(!/^[a-z0-9][a-z0-9-]*$/.test(id)) throw new Error("معرّف الموضوع يجب أن يكون حروفاً إنجليزية صغيرة وأرقاماً و - فقط.");
+        if(isNew && all.some(function(x){ return x.id === id; })) throw new Error("هذا المعرّف مستخدم بالفعل لموضوع آخر.");
+        if(!title) throw new Error("العنوان مطلوب.");
+        var meta = { cat:catSel.value, title:title, icon:iconIn.value.trim() || "📄", keywords:kwIn.value.trim() };
+        if(isNew){
+          var topic = { id:id, cat:meta.cat, title:meta.title, icon:meta.icon, keywords:meta.keywords, sections:[] };
+          var intro = introIn.value.replace(/\s+$/g, "");
+          if(intro.trim()) topic.sections.push({ type:"overview", text:intro, cat:"overview" });
+          return saveGroup("topics", function(content){
+            if(content.some(function(x){ return x.id === id; })) throw conflict("تمت إضافة موضوع بنفس المعرّف من شخص آخر. اختر معرّفاً مختلفاً.");
+            content.push(topic); return content;
+          }, "add-topic").then(function(){ afterTopicSaved(id); });
+        }
+        if(meta.cat === base.cat && meta.title === base.title && meta.icon === (base.icon || "") && meta.keywords === (base.keywords || "")) throw new Error("لم يتم تغيير أي شيء.");
+        return mutateTopic(id, function(t){
+          if(t.cat !== base.cat || t.title !== base.title) throw conflict("تم تعديل هذا الموضوع من شخص آخر. أغلق النافذة وحدّث الصفحة ثم أعد المحاولة.");
+          /* sections that rely on the built-in category map keep their place when the topic is edited */
+          var map = App.meta.TOPIC_CATMAP[t.id] || {};
+          t.sections.forEach(function(s, i){ if(!s.cat && s.type !== "related" && map[i]) s.cat = map[i]; });
+          t.cat = meta.cat; t.title = meta.title; t.icon = meta.icon; t.keywords = meta.keywords;
+        }, "edit-topic").then(function(){ afterTopicSaved(id); });
+      },
+      after:function(){ if(S.editorOpen) openGroup("topics"); }
+    });
+  }
+
+  /* ---- add a new top-level category ("branch") ---- */
+  function categoryForm(){
+    var nameIn = h("input", {class:"kb-input", type:"text", placeholder:"مثال: الدعم الفني"});
+    var iconIn = h("input", {class:"kb-input", type:"text", value:"📁"});
+    var body = h("div", null, h("div", {class:"kb-grid2"}, field("اسم التصنيف", nameIn), field("الأيقونة (إيموجي)", iconIn)),
+      h("p", {class:"kb-note", text:"التصنيف الجديد يظهر في الصفحة. بعد إنشائه أضف إليه المواضيع بزر «＋ موضوع جديد» بجانب عنوانه، وسيظهر في القائمة الجانبية بمجرد إضافة أول موضوع."}));
+    openForm("تصنيف جديد", body, {
+      onSave:function(){
+        var name = nameIn.value.trim().replace(/\s+/g, " "), icon = iconIn.value.trim() || "📁";
+        if(!name) throw new Error("اسم التصنيف مطلوب.");
+        if(name.length > 60) throw new Error("اسم التصنيف طويل جداً.");
+        if(App.meta.catList().indexOf(name) >= 0) throw new Error("يوجد تصنيف بنفس الاسم بالفعل.");
+        return saveGroup("kb_meta", function(content){
+          if(!isObj(content) || !isArr(content.categories)) content = { categories:[] };
+          if(content.categories.some(function(c){ return c.name === name; })) throw conflict("تمت إضافة تصنيف بنفس الاسم من شخص آخر.");
+          content.categories.push({ name:name, icon:icon });
+          return content;
+        }, "add-category").then(function(){
+          setTimeout(function(){ var hd = document.getElementById("cat-" + String(name).replace(/[^a-zA-Z0-9\u0600-\u06FF_-]/g, "-")); if(hd) hd.scrollIntoView({ behavior:"smooth", block:"start" }); }, 80);
+        });
+      }
+    });
+  }
+
+  /* =========================================================
+     Flat table groups (rows) — used by the inline row buttons and the data manager
+     ========================================================= */
   function schemaOf(rows){
     var keys = [], info = {};
     rows.forEach(function(r){
@@ -465,60 +768,11 @@
     keys.forEach(function(k){ if(!info[k].seen) info[k].num = false; });
     return { keys:keys, info:info };
   }
-  function rowTitle(gid, r){
-    var keys = Object.keys(r);
-    var pref = ["name","question_ar","item","label","type","call_status","min"].filter(function(k){ return r[k] !== undefined && r[k] !== null && r[k] !== ""; })[0] || keys[0];
-    var main = r[pref];
-    if(gid.indexOf("fees_") === 0) main = r.min + " → " + r.max;
-    return trunc(main, 80);
-  }
-  function rowSub(gid, r){
-    if(gid.indexOf("fees_") === 0) return "الرسوم: " + r.fee;
-    var parts = [];
-    Object.keys(r).forEach(function(k){
-      if(parts.length >= 3) return;
-      var v = r[k];
-      if(v === null || v === undefined || v === "") return;
-      var s = trunc(v, 40);
-      if(s === trunc(rowTitle(gid, r), 40)) return;
-      parts.push(s);
-    });
-    return parts.join(" · ");
-  }
-  function rowsView(gid){
-    var rows = window.NowPayApp.getData()[gid];
-    var sc = schemaOf(rows);
-    var shownMax = 60;
-    var q = h("input", {class:"kb-input", type:"search", placeholder:"بحث داخل الصفوف…"});
-    var list = h("div");
-    function draw(){
-      list.innerHTML = "";
-      var data = window.NowPayApp.getData()[gid], term = q.value.trim().toLowerCase(), n = 0, matched = 0;
-      data.forEach(function(r, i){
-        if(term && JSON.stringify(r).toLowerCase().indexOf(term) < 0) return;
-        matched++;
-        if(n >= shownMax) return;
-        n++;
-        list.appendChild(h("div", {class:"kb-row-card"},
-          h("div", {class:"kb-row-text"}, h("b", {text:rowTitle(gid, r)}), h("span", {text:rowSub(gid, r)})),
-          h("button", {class:"kb-btn small ghost", type:"button", text:"تعديل", onclick:function(){ rowForm(gid, sc, i); }})));
-      });
-      if(matched > n) list.appendChild(h("p", {class:"kb-note", text:"يتم عرض أول " + n + " من " + matched + " — استخدم البحث لتضييق النتائج."}));
-      if(!matched) list.appendChild(h("p", {class:"kb-note", text:"لا توجد نتائج."}));
-    }
-    q.addEventListener("input", draw);
-    add(edPane,
-      h("h3", {text:GROUP_LABELS[gid] || gid}),
-      h("p", {class:"kb-ed-hint", text:"عدد الصفوف: " + rows.length + ". أي تعديل أو إضافة يُحفظ في Supabase ويظهر لكل أعضاء الفريق."}),
-      h("div", {class:"kb-ed-toolbar"}, q,
-        h("button", {class:"kb-btn", type:"button", text:"＋ إضافة صف جديد", onclick:function(){ rowForm(gid, sc, -1); }}),
-        h("button", {class:"kb-btn ghost", type:"button", text:"{ } تحرير JSON للمجموعة", onclick:function(){ jsonView(gid); }})),
-      list);
-    draw();
-  }
   function rowForm(gid, sc, index){
     var isNew = index < 0;
-    var base = isNew ? null : clone(window.NowPayApp.getData()[gid][index]);
+    var list = D()[gid];
+    if(!isArr(list)) return toast("تعذر فتح هذه البيانات.", "err");
+    var base = isNew ? null : clone(list[index]);
     var inputs = {};
     var grid = h("div", {class:"kb-grid2"});
     sc.keys.forEach(function(k){
@@ -546,367 +800,180 @@
           out[k] = n;
         } else {
           var t = raw.replace(/\s+$/g, "");
-          if(t.trim() === "") out[k] = (base && (base[k] === null || base[k] === undefined) || isNew && f.nulls) ? null : "";
+          if(k === "video" && t.trim() !== "" && !isHttp(t)) throw new Error("رابط الفيديو يجب أن يبدأ بـ http:// أو https://");
+          if(t.trim() === "") out[k] = ((base && (base[k] === null || base[k] === undefined)) || (isNew && f.nulls)) ? null : "";
           else out[k] = t;
         }
       });
-      /* keep any extra keys the row already had that the schema form doesn't show */
-      if(base) Object.keys(base).forEach(function(k){ if(!(k in out)) out[k] = base[k]; });
+      if(base) Object.keys(base).forEach(function(k){ if(!(k in out)) out[k] = base[k]; });   /* keep columns the form does not show */
       var mainKey = sc.keys.filter(function(k){ return !sc.info[k].num; })[0];
       if(mainKey && !out[mainKey] && isNew) throw new Error("الحقل «" + (FIELD_LABELS[mainKey] || mainKey) + "» مطلوب.");
       if(gid.indexOf("fees_") === 0 && out.min > out.max) throw new Error("قيمة «من» يجب ألا تكون أكبر من «إلى».");
       return out;
     }
-    openForm(isNew ? "إضافة صف — " + (GROUP_LABELS[gid] || gid) : "تعديل صف — " + (GROUP_LABELS[gid] || gid), grid, {
+    openForm((isNew ? "إضافة صف — " : "تعديل صف — ") + (GROUP_LABELS[gid] || gid), grid, {
       onSave:function(){
         var next = collect();
         if(!isNew && deepEq(next, base)) throw new Error("لم يتم تغيير أي شيء.");
         return saveGroup(gid, function(content){
           if(isNew){ content.push(next); return content; }
           var i = -1;
-          for(var j = 0; j < content.length; j++){ if(deepEq(content[j], base)) { i = j; break; } }
+          for(var j = 0; j < content.length; j++){ if(deepEq(content[j], base)){ i = j; break; } }
           if(i < 0){
             for(var m = 0; m < content.length; m++){ if(deepEq(content[m], next)) return content; }
-            throw conflict("تم تعديل هذا الصف من شخص آخر. أغلق النافذة وحدّث البيانات ثم أعد المحاولة.");
+            throw conflict("تم تعديل هذا الصف من شخص آخر. أغلق النافذة وحدّث الصفحة ثم أعد المحاولة.");
           }
           content[i] = next; return content;
-        });
+        }, isNew ? "add-row" : "edit-row");
       },
-      after:function(){ openGroup(gid); }
+      after:function(){ if(S.editorOpen) openGroup(gid); }
     });
   }
 
-  /* ---------- raw JSON editor for a whole group (advanced) ---------- */
-  function jsonView(gid){
+  /* =========================================================
+     Data manager (all 18 groups, including the ones not shown on any page)
+     ========================================================= */
+  var ed = null, edSide = null, edPane = null, activeGroup = null;
+  function groupKeys(){
+    var d = D();
+    var keys = GROUP_ORDER.filter(function(k){ return d[k] !== undefined; });
+    Object.keys(d).forEach(function(k){ if(keys.indexOf(k) < 0 && k !== "kb_meta") keys.push(k); });
+    return keys;
+  }
+  function displayedGroups(){
+    var shown = { topics:true }, d = D();
+    (d.topics || []).forEach(function(t){ (t.sections || []).forEach(function(s){ if(s.type === "table_ref" && s.ref) shown[s.ref] = true; }); });
+    return shown;
+  }
+  function openEditor(gid){
+    if(!ed){
+      edSide = h("div", {class:"kb-ed-side"});
+      edPane = h("div", {class:"kb-ed-pane"});
+      ed = h("div", {class:"kb-editor", id:"kb-editor", hidden:true},
+        h("div", {class:"kb-ed-box", role:"dialog", "aria-modal":"true", "aria-label":"إدارة بيانات الموقع"},
+          h("div", {class:"kb-ed-head"},
+            h("h2", {text:"✏️ إدارة بيانات الموقع"}),
+            h("button", {class:"kb-btn", type:"button", text:"⬇ نسخة احتياطية JSON", onclick:exportBackup}),
+            h("button", {class:"kb-btn", type:"button", text:"✕ إغلاق", onclick:closeEditor})),
+          h("div", {class:"kb-ed-main"}, edSide, edPane)));
+      document.body.appendChild(ed);
+      document.addEventListener("keydown", function(e){ if(e.key === "Escape" && S.editorOpen && !document.querySelector(".kb-form-overlay, .kb-pin-overlay")) closeEditor(); });
+    }
+    ed.hidden = false; S.editorOpen = true;
+    document.body.style.overflow = "hidden";
+    if(gid) activeGroup = gid;
+    renderSide();
+    if(!activeGroup) activeGroup = "topics";
+    openGroup(activeGroup);
+  }
+  function closeEditor(){
+    if(!ed) return;
+    ed.hidden = true; S.editorOpen = false; document.body.style.overflow = "";
+  }
+  function renderSide(){
+    edSide.innerHTML = "";
+    var d = D(), shown = displayedGroups();
+    groupKeys().forEach(function(k){
+      var v = d[k];
+      var n = isArr(v) ? v.length : "";
+      edSide.appendChild(h("button", {class:"kb-ed-group" + (k === activeGroup ? " active" : ""), type:"button", onclick:function(){ openGroup(k); }},
+        h("span", {text:GROUP_LABELS[k] || k}),
+        shown[k] ? null : h("span", {class:"tag", title:"هذه المجموعة محفوظة لكنها غير معروضة حالياً في أي صفحة من الموقع", text:"غير معروضة"}),
+        h("span", {class:"n", text:String(n)})));
+    });
+  }
+  function openGroup(gid){
+    activeGroup = gid; renderSide();
+    var v = D()[gid];
     edPane.innerHTML = ""; edPane.scrollTop = 0;
-    var d = window.NowPayApp.getData();
-    var baseContent = clone(d[gid]);
-    var ta = h("textarea", {class:"kb-textarea kb-json", spellcheck:"false", value:JSON.stringify(baseContent, null, 2)});
-    var err = h("div", {class:"kb-form-err", hidden:true, style:"margin:10px 0"});
-    var btn = h("button", {class:"kb-btn", type:"button", text:"حفظ JSON"});
-    btn.addEventListener("click", function(){
-      err.hidden = true;
-      var parsed;
-      try { parsed = JSON.parse(ta.value); } catch(e){ err.textContent = "JSON غير صالح: " + e.message; err.hidden = false; return; }
-      if(isArr(baseContent) !== isArr(parsed)){ err.textContent = "نوع البيانات يجب أن يبقى " + (isArr(baseContent) ? "قائمة [ ]" : "كائن { }") + " كما هو."; err.hidden = false; return; }
-      if(isArr(parsed) && gid === "topics" && !parsed.length){ err.textContent = "لا يمكن حفظ قائمة مواضيع فارغة."; err.hidden = false; return; }
-      if(deepEq(parsed, baseContent)){ err.textContent = "لم يتم تغيير أي شيء."; err.hidden = false; return; }
-      if(!window.confirm("سيتم استبدال بيانات «" + (GROUP_LABELS[gid] || gid) + "» بالكامل بهذا الـ JSON. هل أنت متأكد؟ (يُنصح بتنزيل نسخة احتياطية أولاً)")) return;
-      btn.disabled = true; btn.textContent = "جاري الحفظ…";
-      saveGroup(gid, function(content){
-        if(!deepEq(content, baseContent)) throw conflict("تم تعديل هذه المجموعة من شخص آخر. أعد التحميل ثم حاول مرة أخرى.");
-        return parsed;
-      }).then(function(){ toast("تم الحفظ ✓", "ok", 2200); openGroup(gid); })
-        .catch(function(e){ btn.disabled = false; btn.textContent = "حفظ JSON"; err.textContent = friendlyError(e); err.hidden = false; });
-    });
-    add(edPane, h("h3", {text:"JSON — " + (GROUP_LABELS[gid] || gid)}),
-      h("p", {class:"kb-ed-hint", text:"للمستخدمين المتقدمين: تحرير مباشر للبيانات الخام بنفس هيكل الموقع. الحفظ يستبدل المجموعة بالكامل."}),
-      ta, err, h("div", {class:"kb-ed-toolbar", style:"margin-top:10px"}, btn,
-        h("button", {class:"kb-btn ghost", type:"button", text:"رجوع", onclick:function(){ openGroup(gid); }})));
+    if(gid === "topics") topicsView();
+    else if(isArr(v) && v.every(isObj)) rowsView(gid);
+    else add(edPane, h("p", {class:"kb-note", text:"لا يمكن عرض هذه المجموعة هنا."}));
   }
-
-  /* ---------- topics ---------- */
+  function exportBackup(){
+    var blob = new Blob([JSON.stringify({ exported_at:new Date().toISOString(), source:"supabase:" + TABLE, groups:D() }, null, 2)], { type:"application/json" });
+    var a = h("a", { href:URL.createObjectURL(blob), download:"nowpay-kb-backup-" + new Date().toISOString().slice(0, 10) + ".json" });
+    document.body.appendChild(a); a.click();
+    setTimeout(function(){ URL.revokeObjectURL(a.href); a.remove(); }, 500);
+  }
+  function rowTitle(gid, r){
+    var keys = Object.keys(r);
+    var pref = ["name","question_ar","item","label","type","call_status","min"].filter(function(k){ return r[k] !== undefined && r[k] !== null && r[k] !== ""; })[0] || keys[0];
+    var main = r[pref];
+    if(gid.indexOf("fees_") === 0) main = r.min + " → " + r.max;
+    return trunc(main, 80);
+  }
+  function rowSub(gid, r){
+    if(gid.indexOf("fees_") === 0) return "الرسوم: " + r.fee;
+    var parts = [];
+    Object.keys(r).forEach(function(k){
+      if(parts.length >= 3) return;
+      var v = r[k];
+      if(v === null || v === undefined || v === "") return;
+      var s = trunc(v, 40);
+      if(s === trunc(rowTitle(gid, r), 40)) return;
+      parts.push(s);
+    });
+    return parts.join(" · ");
+  }
+  function rowsView(gid){
+    var rows = D()[gid];
+    var sc = schemaOf(rows);
+    var shownMax = 60;
+    var q = h("input", {class:"kb-input", type:"search", placeholder:"بحث داخل الصفوف…"});
+    var list = h("div");
+    function draw(){
+      list.innerHTML = "";
+      var data = D()[gid], term = q.value.trim().toLowerCase(), n = 0, matched = 0;
+      data.forEach(function(r, i){
+        if(term && JSON.stringify(r).toLowerCase().indexOf(term) < 0) return;
+        matched++;
+        if(n >= shownMax) return;
+        n++;
+        list.appendChild(h("div", {class:"kb-row-card"},
+          h("div", {class:"kb-row-text"}, h("b", {text:rowTitle(gid, r)}), h("span", {text:rowSub(gid, r)})),
+          h("button", {class:"kb-btn small ghost", type:"button", text:"تعديل", onclick:function(){ unlockThen(function(){ rowForm(gid, sc, i); }); }})));
+      });
+      if(matched > n) list.appendChild(h("p", {class:"kb-note", text:"يتم عرض أول " + n + " من " + matched + " — استخدم البحث لتضييق النتائج."}));
+      if(!matched) list.appendChild(h("p", {class:"kb-note", text:"لا توجد نتائج."}));
+    }
+    q.addEventListener("input", draw);
+    add(edPane,
+      h("h3", {text:GROUP_LABELS[gid] || gid}),
+      h("p", {class:"kb-ed-hint", text:"عدد الصفوف: " + rows.length + ". أي تعديل أو إضافة يُحفظ في Supabase ويظهر لكل أعضاء الفريق، ويُحفظ قبلها نسخة احتياطية تلقائية."}),
+      h("div", {class:"kb-ed-toolbar"}, q,
+        h("button", {class:"kb-btn", type:"button", text:"＋ إضافة صف جديد", onclick:function(){ unlockThen(function(){ rowForm(gid, sc, -1); }); }})),
+      list);
+    draw();
+  }
   function topicsView(){
-    var M = window.NowPayApp.meta, d = window.NowPayApp.getData();
+    var M = App.meta, d = D();
     add(edPane, h("h3", {text:"المواضيع (صفحات الموقع)"}),
-      h("p", {class:"kb-ed-hint", text:"اختر موضوعاً لتعديل عنوانه وأقسامه، أو أضف موضوعاً جديداً. الموضوع الجديد يظهر تلقائياً في القائمة الجانبية وفي البحث."}),
+      h("p", {class:"kb-ed-hint", text:"اختر موضوعاً لتعديل عنوانه وتصنيفه، أو أضف موضوعاً جديداً. لتعديل الأقسام والعناصر استخدم أزرار ✏️ و＋ داخل صفحة الموضوع نفسها."}),
       h("div", {class:"kb-ed-toolbar"},
-        h("button", {class:"kb-btn", type:"button", text:"＋ موضوع جديد", onclick:function(){ topicForm(null); }}),
-        h("button", {class:"kb-btn ghost", type:"button", text:"{ } تحرير JSON للمجموعة", onclick:function(){ jsonView("topics"); }})));
-    var cats = M.CAT_ORDER.slice();
-    d.topics.forEach(function(t){ if(cats.indexOf(t.cat) < 0) cats.push(t.cat); });
-    cats.forEach(function(cat){
+        h("button", {class:"kb-btn", type:"button", text:"＋ موضوع جديد", onclick:function(){ unlockThen(function(){ topicForm(null); }); }}),
+        h("button", {class:"kb-btn ghost", type:"button", text:"＋ تصنيف جديد", onclick:function(){ unlockThen(function(){ categoryForm(); }); }})));
+    M.catList().forEach(function(cat){
       var items = d.topics.filter(function(t){ return t.cat === cat; });
       if(!items.length) return;
-      edPane.appendChild(h("div", {class:"kb-cat-label", text:(M.CAT_ICON[cat] || "📁") + " " + cat}));
+      edPane.appendChild(h("div", {class:"kb-cat-label", text:(M.catIcon(cat) || "📁") + " " + cat}));
       items.forEach(function(t){
         edPane.appendChild(h("div", {class:"kb-row-card"},
           h("div", {class:"kb-row-text"}, h("b", {text:(t.icon || "") + " " + t.title}), h("span", {text:t.sections.length + " قسم · " + t.id})),
-          h("button", {class:"kb-btn small ghost", type:"button", text:"تعديل", onclick:function(){ topicForm(t.id); }})));
+          h("button", {class:"kb-btn small ghost", type:"button", text:"تعديل", onclick:function(){ unlockThen(function(){ topicForm(t.id); }); }})));
       });
     });
   }
-
-  function newSection(type){
-    var s = newSection0(type); s._new = true; return s;
-  }
-  function newSection0(type){
-    var cat = DEFAULT_SEC_CAT[type];
-    switch(type){
-      case "overview": return { type:type, text:"", cat:cat };
-      case "faq": return { type:type, title:"", items:[{ q:"", a:"", video:null }], cat:cat };
-      case "statuses": return { type:type, title:"", items:[{ name:"", desc:"" }], cat:cat };
-      case "link_cards": return { type:type, title:"", items:[{ name:"", url:"", purpose:"", uses:[] }], cat:cat };
-      case "related": return { type:type, items:[] };
-      default: return { type:type, title:"", items:[""], cat:cat };
-    }
-  }
-  function topicForm(topicId){
-    var M = window.NowPayApp.meta, all = window.NowPayApp.getData().topics;
-    var isNew = !topicId;
-    var base = isNew ? null : clone(all.filter(function(t){ return t.id === topicId; })[0]);
-    var work = isNew ? { id:"", cat:M.CAT_ORDER[0], title:"", icon:"📄", keywords:"", sections:[] } : clone(base);
-    /* Freeze each section's category from the built-in map so reordering / adding never changes where content shows. */
-    if(!isNew){
-      var map = M.TOPIC_CATMAP[work.id] || {};
-      work.sections.forEach(function(s, i){ if(!s.cat && s.type !== "related" && map[i]) s.cat = map[i]; });
-    }
-    var body = h("div"), secBox = h("div"), jsonBox = null;
-
-    var idIn = h("input", {class:"kb-input", type:"text", dir:"ltr", value:work.id, disabled:!isNew, placeholder:"مثال: new-topic (حروف إنجليزية صغيرة وأرقام و -)"});
-    var catSel = h("select", {class:"kb-select"});
-    M.CAT_ORDER.concat(M.CAT_ORDER.indexOf(work.cat) < 0 ? [work.cat] : []).forEach(function(c){
-      var o = h("option", {value:c, text:c}); if(c === work.cat) o.selected = true; catSel.appendChild(o);
-    });
-    var iconIn = h("input", {class:"kb-input", type:"text", value:work.icon});
-    var titleIn = h("input", {class:"kb-input", type:"text", value:work.title});
-    var kwIn = h("textarea", {class:"kb-textarea", rows:"2", value:work.keywords || ""});
-    idIn.addEventListener("input", function(){ work.id = idIn.value.trim(); });
-    catSel.addEventListener("change", function(){ work.cat = catSel.value; });
-    iconIn.addEventListener("input", function(){ work.icon = iconIn.value; });
-    titleIn.addEventListener("input", function(){ work.title = titleIn.value; });
-    kwIn.addEventListener("input", function(){ work.keywords = kwIn.value; });
-
-    add(body,
-      h("div", {class:"kb-grid2"}, field("معرّف الموضوع (id)", idIn, isNew ? "لا يمكن تغييره لاحقاً." : "ثابت ولا يمكن تغييره."), field("التصنيف", catSel),
-        field("العنوان", titleIn), field("الأيقونة (إيموجي)", iconIn)),
-      field("كلمات البحث (keywords)", kwIn, "كلمات إضافية تساعد البحث على إيجاد هذا الموضوع."),
-      h("div", {class:"kb-cat-label", text:"الأقسام"}), secBox,
-      h("div", {class:"kb-ed-toolbar"},
-        (function(){
-          var sel = h("select", {class:"kb-select", style:"max-width:220px"});
-          ADDABLE.forEach(function(t){ sel.appendChild(h("option", {value:t, text:SECTION_TYPES[t]})); });
-          var addBtn = h("button", {class:"kb-btn ghost", type:"button", text:"＋ إضافة قسم", onclick:function(){
-            if(sel.value === "related" && work.sections.some(function(s){ return s.type === "related"; })){ toast("يوجد قسم «مواضيع ذات صلة» بالفعل.", "err"); return; }
-            work.sections.push(newSection(sel.value)); drawSecs(); body.dispatchEvent(new Event("input"));
-          }});
-          return h("span", {style:"display:flex;gap:8px;align-items:center"}, sel, addBtn);
-        })(),
-        h("button", {class:"kb-btn ghost small", type:"button", text:"{ } JSON متقدم لهذا الموضوع", onclick:function(){ toggleJson(); }})));
-
-    function toggleJson(){
-      if(jsonBox){ jsonBox.remove(); jsonBox = null; return; }
-      var ta = h("textarea", {class:"kb-textarea kb-json", spellcheck:"false", value:JSON.stringify(work, null, 2)});
-      var msg = h("div", {class:"kb-note"});
-      jsonBox = h("div", {class:"kb-sec"}, h("div", {class:"kb-sec-head", text:"JSON الخام لهذا الموضوع"}),
-        h("div", {class:"kb-sec-body"}, ta, msg, h("button", {class:"kb-btn small", type:"button", text:"تطبيق على النموذج", onclick:function(){
-          try {
-            var p = JSON.parse(ta.value);
-            if(!isObj(p) || !isArr(p.sections)) throw new Error("يجب أن يكون كائناً يحتوي على مصفوفة sections.");
-            if(!isNew && p.id !== work.id) throw new Error("لا يمكن تغيير id الموضوع.");
-            work = p; idIn.value = p.id || ""; titleIn.value = p.title || ""; iconIn.value = p.icon || ""; kwIn.value = p.keywords || "";
-            catSel.value = p.cat; drawSecs(); msg.textContent = "تم التطبيق ✓";
-          } catch(e){ msg.textContent = "خطأ: " + e.message; }
-        }})));
-      body.appendChild(jsonBox);
-    }
-
-    function itemList(sec, key, placeholder, long){
-      var wrap = h("div");
-      function draw(){
-        wrap.innerHTML = "";
-        sec[key].forEach(function(v, i){
-          var inp = long ? h("textarea", {class:"kb-textarea", rows:"2", value:v, placeholder:placeholder || ""}) : h("input", {class:"kb-input", type:"text", value:v, placeholder:placeholder || ""});
-          inp.addEventListener("input", function(){ sec[key][i] = inp.value; });
-          wrap.appendChild(h("div", {class:"kb-item-row"}, inp));
-        });
-        wrap.appendChild(h("button", {class:"kb-btn small ghost", type:"button", text:"＋ بند جديد", onclick:function(){ sec[key].push(""); draw(); }}));
-      }
-      draw(); return wrap;
-    }
-    function objItems(sec, defs, makeNew){
-      var wrap = h("div");
-      function draw(){
-        wrap.innerHTML = "";
-        sec.items.forEach(function(it){
-          var box = h("div", {class:"kb-subitem"});
-          defs.forEach(function(df){
-            var cur = df.list ? (it[df.k] || []).join("\n") : (it[df.k] == null ? "" : it[df.k]);
-            var inp = df.long || df.list ? h("textarea", {class:"kb-textarea", rows:df.list ? "3" : "3", value:cur}) : h("input", {class:"kb-input", type:"text", value:cur, dir:df.ltr ? "ltr" : null});
-            inp.addEventListener("input", function(){
-              if(df.list) it[df.k] = inp.value.split("\n").map(function(x){ return x.trim(); }).filter(Boolean);
-              else if(df.nullable && inp.value.trim() === "") it[df.k] = null;
-              else it[df.k] = inp.value;
-            });
-            box.appendChild(field(df.label, inp));
-          });
-          wrap.appendChild(box);
-        });
-        wrap.appendChild(h("button", {class:"kb-btn small ghost", type:"button", text:"＋ عنصر جديد", onclick:function(){ sec.items.push(makeNew()); draw(); }}));
-      }
-      draw(); return wrap;
-    }
-    function secBody(sec){
-      switch(sec.type){
-        case "overview": {
-          var ta = h("textarea", {class:"kb-textarea", rows:"5", value:sec.text || ""});
-          ta.addEventListener("input", function(){ sec.text = ta.value; });
-          return ta;
-        }
-        case "list": case "steps": case "notes": case "validation": case "videos": {
-          var t = h("input", {class:"kb-input", type:"text", value:sec.title || "", placeholder:"عنوان القسم (اختياري)"});
-          t.addEventListener("input", function(){ sec.title = t.value; });
-          if(!isArr(sec.items)) sec.items = [];
-          return h("div", null, sec.type === "videos" ? null : field("العنوان", t),
-            itemList(sec, "items", sec.type === "videos" ? "https://…" : "", sec.type !== "videos"));
-        }
-        case "faq": {
-          var ft = h("input", {class:"kb-input", type:"text", value:sec.title || ""});
-          ft.addEventListener("input", function(){ sec.title = ft.value; });
-          return h("div", null, field("العنوان", ft), objItems(sec, [
-            { k:"q", label:"السؤال" }, { k:"a", label:"الإجابة", long:true }, { k:"video", label:"رابط فيديو (اختياري)", ltr:true, nullable:true }
-          ], function(){ return { q:"", a:"", video:null }; }));
-        }
-        case "statuses": {
-          var st = h("input", {class:"kb-input", type:"text", value:sec.title || ""});
-          st.addEventListener("input", function(){ sec.title = st.value; });
-          return h("div", null, field("العنوان", st), objItems(sec, [{ k:"name", label:"الاسم" }, { k:"desc", label:"الوصف", long:true }], function(){ return { name:"", desc:"" }; }));
-        }
-        case "link_cards": {
-          var lt = h("input", {class:"kb-input", type:"text", value:sec.title || ""});
-          lt.addEventListener("input", function(){ sec.title = lt.value; });
-          return h("div", null, field("العنوان", lt), objItems(sec, [
-            { k:"name", label:"الاسم" }, { k:"url", label:"الرابط", ltr:true }, { k:"purpose", label:"الغرض", long:true }, { k:"uses", label:"يُستخدم من أجل (سطر لكل بند)", list:true }
-          ], function(){ return { name:"", url:"", purpose:"", uses:[] }; }));
-        }
-        case "related": {
-          var ids = h("input", {class:"kb-input", type:"text", dir:"ltr", value:(sec.items || []).join(", ")});
-          ids.addEventListener("input", function(){ sec.items = ids.value.split(",").map(function(x){ return x.trim(); }).filter(Boolean); });
-          return field("معرّفات المواضيع (مفصولة بفاصلة)", ids, "المعرّفات المتاحة: " + all.map(function(t){ return t.id; }).join(", "));
-        }
-        case "table_ref":
-          return h("p", {class:"kb-note", text:"جدول مرتبط بالمجموعة «" + (GROUP_LABELS[sec.ref] || sec.ref) + "» — يُعدَّل محتواه من هذه المجموعة في القائمة الجانبية للمحرر."});
-        default:
-          return h("p", {class:"kb-note", text:"نوع قسم غير معروف (" + sec.type + ") — يمكن تعديله من «JSON متقدم»."});
-      }
-    }
-    function drawSecs(){
-      secBox.innerHTML = "";
-      work.sections.forEach(function(sec, i){
-        var catSelS = null;
-        if(sec.type !== "related" && !(sec.type === "table_ref" && String(sec.ref).indexOf("actions_") === 0)){
-          catSelS = h("select", {class:"kb-select", title:"أين يظهر هذا القسم داخل الصفحة"});
-          M.SEC_CAT_ORDER.forEach(function(c){ var o = h("option", {value:c, text:M.SEC_CAT_LABEL[c]}); if(c === sec.cat) o.selected = true; catSelS.appendChild(o); });
-          if(!sec.cat){ catSelS.insertBefore(h("option", {value:"", text:"— غير محدد (لن يظهر) —", selected:true}), catSelS.firstChild); }
-          catSelS.addEventListener("change", function(){ sec.cat = catSelS.value; });
-        }
-        var up = h("button", {class:"kb-btn small ghost", type:"button", text:"↑", title:"تحريك لأعلى", disabled:i === 0, onclick:function(){ swap(i, i - 1); }});
-        var down = h("button", {class:"kb-btn small ghost", type:"button", text:"↓", title:"تحريك لأسفل", disabled:i === work.sections.length - 1, onclick:function(){ swap(i, i + 1); }});
-        secBox.appendChild(h("div", {class:"kb-sec"},
-          h("div", {class:"kb-sec-head"}, h("span", {text:(i + 1) + ". " + (SECTION_TYPES[sec.type] || sec.type)}), h("span", {class:"spacer"}), catSelS, up, down),
-          h("div", {class:"kb-sec-body"}, secBody(sec))));
-      });
-      if(!work.sections.length) secBox.appendChild(h("p", {class:"kb-note", text:"لا توجد أقسام بعد."}));
-    }
-    function swap(a, b){ var x = work.sections[a]; work.sections[a] = work.sections[b]; work.sections[b] = x; drawSecs(); body.dispatchEvent(new Event("input")); }
-    drawSecs();
-
-    function finalize(){
-      var t = clone(work);
-      t.id = String(t.id || "").trim(); t.title = String(t.title || "").trim();
-      if(!/^[a-z0-9][a-z0-9-]*$/.test(t.id)) throw new Error("معرّف الموضوع يجب أن يكون حروفاً إنجليزية صغيرة وأرقاماً و - فقط.");
-      if(isNew && all.some(function(x){ return x.id === t.id; })) throw new Error("هذا المعرّف مستخدم بالفعل لموضوع آخر.");
-      if(!t.title) throw new Error("العنوان مطلوب.");
-      if(!t.cat) throw new Error("التصنيف مطلوب.");
-      t.icon = t.icon || "📄"; t.keywords = t.keywords || "";
-      var ids = {}; all.forEach(function(x){ ids[x.id] = true; }); ids[t.id] = true;
-      var out = [];
-      t.sections.forEach(function(s, i){
-        var n = i + 1, lab = SECTION_TYPES[s.type] || s.type;
-        if(s.type === "overview"){ s.text = String(s.text || "").trim(); if(!s.text) return; }
-        else if(["list","steps","notes","validation","videos"].indexOf(s.type) >= 0){
-          s.items = (s.items || []).map(function(x){ return String(x).trim(); }).filter(Boolean);
-          if(!s.items.length) return;
-          if(s.type === "videos") s.items.forEach(function(u){ if(!/^https?:\/\/\S+$/i.test(u)) throw new Error("القسم " + n + " (" + lab + "): رابط غير صالح: " + u); });
-          if(s.title !== undefined) s.title = String(s.title).trim();
-        }
-        else if(s.type === "faq"){
-          s.items = (s.items || []).filter(function(x){ return String(x.q || "").trim() || String(x.a || "").trim(); });
-          s.items.forEach(function(x){ if(!String(x.q || "").trim() || !String(x.a || "").trim()) throw new Error("القسم " + n + " (أسئلة): كل سؤال يحتاج سؤالاً وإجابة."); });
-          if(!s.items.length) return;
-        }
-        else if(s.type === "statuses"){
-          s.items = (s.items || []).filter(function(x){ return String(x.name || "").trim() || String(x.desc || "").trim(); });
-          s.items.forEach(function(x){ if(!String(x.name || "").trim()) throw new Error("القسم " + n + " (حالات): كل حالة تحتاج اسماً."); });
-          if(!s.items.length) return;
-        }
-        else if(s.type === "link_cards"){
-          s.items = (s.items || []).filter(function(x){ return String(x.name || "").trim() || String(x.url || "").trim(); });
-          s.items.forEach(function(x){ if(!String(x.name || "").trim() || !/^https?:\/\/\S+$/i.test(String(x.url || "").trim())) throw new Error("القسم " + n + " (روابط): كل عنصر يحتاج اسماً ورابطاً يبدأ بـ http."); x.url = x.url.trim(); });
-          if(!s.items.length) return;
-        }
-        else if(s.type === "related"){
-          s.items = (s.items || []).map(String).filter(Boolean);
-          s.items.forEach(function(id){ if(!ids[id]) throw new Error("مواضيع ذات صلة: المعرّف غير موجود: " + id); });
-          if(!s.items.length && s._new) return;   /* an existing (even empty) related block is always kept */
-        }
-        if(!s.cat) delete s.cat;
-        if(s._new && s.type !== "related" && !s.cat) throw new Error("القسم " + n + " (" + lab + "): اختر مكان ظهور القسم داخل الصفحة.");
-        delete s._new;
-        out.push(s);
-      });
-      t.sections = out;
-      return t;
-    }
-
-    openForm(isNew ? "موضوع جديد" : "تعديل الموضوع: " + base.title, body, {
-      onSave:function(){
-        var next = finalize();
-        if(!isNew && deepEq(next, base)) throw new Error("لم يتم تغيير أي شيء.");
-        return saveGroup("topics", function(content){
-          if(isNew){
-            if(content.some(function(x){ return x.id === next.id; })) throw conflict("تمت إضافة موضوع بنفس المعرّف من شخص آخر. اختر معرّفاً مختلفاً.");
-            content.push(next); return content;
-          }
-          var i = -1;
-          for(var j = 0; j < content.length; j++){ if(content[j].id === next.id) { i = j; break; } }
-          if(i < 0) throw conflict("لم يتم العثور على الموضوع. حدّث البيانات وحاول مرة أخرى.");
-          if(!deepEq(stripCats(content[i]), stripCats(base)) && !deepEq(content[i], next)) throw conflict("تم تعديل هذا الموضوع من شخص آخر أثناء عملك. أغلق النافذة وحدّث البيانات ثم أعد المحاولة.");
-          content[i] = next; return content;
-        });
-      },
-      after:function(){ openGroup("topics"); }
-    });
-  }
-  /* base (as loaded) vs fresh row from DB: compare ignoring the `cat` we froze into sections. */
-  function stripCats(t){ var c = clone(t); (c.sections || []).forEach(function(s){ delete s.cat; }); return c; }
 
   /* ---------------- boot ---------------- */
   function boot(){
-    if(!window.supabase || !window.supabase.createClient){
-      gateError("تعذر تحميل مكتبة Supabase (قد يكون الاتصال بالإنترنت أو مانع الإعلانات هو السبب).", [
-        h("button", {class:"kb-btn", type:"button", text:"إعادة تحميل الصفحة", onclick:function(){ window.location.reload(); }}),
-        h("button", {class:"kb-btn ghost", type:"button", text:"عرض النسخة المدمجة (قراءة فقط)", onclick:openReadOnly})
-      ]);
-      return;
-    }
-    gateLoading("جاري التحقق من الجلسة…");
-    S.client = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY, {
-      auth:{ persistSession:true, autoRefreshToken:true, detectSessionInUrl:false }
-    });
-    S.client.auth.onAuthStateChange(function(event, session){
-      /* never await supabase calls inside this callback — defer them */
-      setTimeout(function(){
-        if(event === "SIGNED_OUT" && S.started && !S.readOnly) window.location.reload();
-        else if(session) S.session = session;
-      }, 0);
-    });
-    S.client.auth.getSession().then(function(r){
-      if(r.error) throw r.error;
-      if(r.data && r.data.session){ S.session = r.data.session; return onAuthenticated(); }
-      gateLogin("");
-    }).catch(function(err){
-      gateError("تعذر التحقق من الجلسة: " + (err.message || err), [
-        h("button", {class:"kb-btn", type:"button", text:"إعادة المحاولة", onclick:boot}),
-        h("button", {class:"kb-btn ghost", type:"button", text:"تسجيل الدخول", onclick:function(){ gateLogin(""); }})
-      ]);
-    });
+    mountTopbar();
+    loadLatest(true);
     document.addEventListener("visibilitychange", function(){
-      if(document.visibilityState === "visible" && S.started && !S.readOnly && !S.editorOpen && S.session && Date.now() - S.lastLoad > AUTO_REFRESH_MS)
-        loadAndShow(true);
+      if(document.visibilityState === "visible" && !S.editorOpen && !document.querySelector(".kb-form-overlay, .kb-pin-overlay") && Date.now() - S.lastLoad > AUTO_REFRESH_MS) loadLatest(true);
     });
   }
-
   if(document.readyState === "loading") document.addEventListener("DOMContentLoaded", boot);
   else boot();
+  window.NowPayAdmin = { reload:function(){ return loadLatest(false); }, isUnlocked:hasToken };   /* small public surface (no secrets) */
 })();

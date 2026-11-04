@@ -1,0 +1,6 @@
+# Only the settings this feature needs. Merge into your existing supabase/config.toml if you already have one.
+
+[functions.kb-editor]
+# The project uses sb_publishable_ / sb_secret_ keys, which the platform JWT check does not understand.
+# The function authorizes every request itself (numeric PIN -> signed short-lived token).
+verify_jwt = false
