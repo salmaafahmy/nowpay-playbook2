@@ -204,11 +204,11 @@
   }
   function discardDraft(){
     if(!window.confirm("سيتم تجاهل كل التعديلات غير المنشورة والرجوع للنسخة المنشورة. متأكدة؟")) return;
-    lsDel(DRAFT_KEY); App.setData(clone(EMBEDDED)); App.rebuild(); renderModeBar();
+    lsDel(DRAFT_KEY); App.setData(clone(EMBEDDED)); App.rebuild(); xlDiscard(); renderModeBar();
     toast("تم تجاهل المسودة.", "ok", 2500);
   }
   function leaveEditMode(){
-    if(Object.keys(changedGroups()).length && !window.confirm("لديك تعديلات غير منشورة محفوظة في هذا المتصفح (لن تظهر للزوار). إنهاء وضع التعديل؟ يمكنك العودة بإضافة ?edit=1 للرابط.")) return;
+    if((Object.keys(changedGroups()).length || xlCount()) && !window.confirm("لديك تعديلات غير منشورة محفوظة في هذا المتصفح (لن تظهر للزوار). إنهاء وضع التعديل؟ يمكنك العودة بإضافة ?edit=1 للرابط.")) return;
     lsDel(MODE_KEY); location.href = location.pathname;
   }
 
@@ -219,17 +219,24 @@
     var anchor = host.querySelector(".notif-bell-wrap");
     var bar = h("div", {class:"kb-userbar", id:"kb-userbar"},
       h("button", {class:"kb-edit-btn", id:"kb-manage-btn", type:"button", title:"إدارة كل بيانات الموقع", onclick:function(){ openEditor(); }}, "✏️ ", h("span", {class:"kb-lbl", text:"إدارة البيانات"})),
-      h("button", {id:"kb-export-btn", type:"button", title:"تنزيل index.html بعد التعديلات", onclick:downloadExport}, "⬇ ", h("span", {class:"kb-lbl", text:"تنزيل index.html المحدّث"})));
+      h("button", {id:"kb-export-btn", type:"button", title:"تنزيل index.html بعد التعديلات", onclick:downloadExport}, "⬇ ", h("span", {class:"kb-lbl", text:"تنزيل index.html المحدّث"})),
+      h("button", {id:"kb-export-xlsx-btn", type:"button", hidden:true, title:"تنزيل Process.xlsx بعد التعديلات", onclick:downloadXlsx}, "⬇ ", h("span", {class:"kb-lbl", text:"تنزيل Process.xlsx المحدّث"})));
     if(anchor) host.insertBefore(bar, anchor); else host.appendChild(bar);
   }
   function renderModeBar(){
     var old = document.getElementById("kb-banner");
     if(old) old.parentNode.removeChild(old);
-    var n = Object.keys(changedGroups()).length;
+    var n = Object.keys(changedGroups()).length, nx = xlCount();
+    var msg;
+    if(!n && !nx) msg = "وضع التعديل مفعّل — أي تعديل يظهر لك فقط حتى تنزّلي الملف المحدّث وترفعيه على GitHub.";
+    else msg = "لديك تعديلات غير منشورة (تظهر لك فقط). " + (n ? "محتوى الموقع ← نزّلي index.html. " : "") + (nx ? "صفحات الإكسيل ← نزّلي Process.xlsx. " : "") + "وارفعي كل ملف على GitHub بنفس اسمه.";
+    var xb = document.getElementById("kb-export-xlsx-btn");
+    if(xb) xb.hidden = !nx;
     var b = h("div", {class:"kb-banner kb-modebar", id:"kb-banner", role:"status"},
-      h("span", {text:n ? "وضع التعديل مفعّل — لديك تعديلات غير منشورة (تظهر لك فقط). نزّلي الملف وارفعيه على GitHub لنشرها." : "وضع التعديل مفعّل — أي تعديل يظهر لك فقط حتى تنزّلي الملف المحدّث وترفعيه على GitHub."}),
+      h("span", {text:msg}),
       h("button", {class:"kb-ib", type:"button", text:"⬇ تنزيل index.html المحدّث", onclick:downloadExport, disabled:!n}),
-      n ? h("button", {class:"kb-ib", type:"button", text:"↺ تجاهل التعديلات", onclick:discardDraft}) : null,
+      nx ? h("button", {class:"kb-ib", type:"button", text:"⬇ تنزيل Process.xlsx المحدّث", onclick:downloadXlsx}) : null,
+      (n || nx) ? h("button", {class:"kb-ib", type:"button", text:"↺ تجاهل التعديلات", onclick:discardDraft}) : null,
       h("button", {class:"kb-ib", type:"button", text:"إنهاء وضع التعديل", onclick:leaveEditMode}));
     var topbar = document.querySelector(".topbar");
     if(topbar && topbar.parentNode) topbar.parentNode.insertBefore(b, topbar.nextSibling);
@@ -256,7 +263,7 @@
       catch(e){ err.textContent = e.message; err.hidden = false; return; }
       saveBtn.disabled = true; cancel.disabled = true; saveBtn.textContent = "جاري الحفظ…";
       Promise.resolve(result).then(function(){
-        toast("تم ✓ — محفوظ كمسودة في هذا المتصفح. نزّلي index.html المحدّث لنشره.", "ok", 3500);
+        toast(opts.doneMsg || "تم ✓ — محفوظ كمسودة في هذا المتصفح. نزّلي index.html المحدّث لنشره.", "ok", 3500);
         close(true);
         if(opts.after) opts.after();
       }).catch(function(e){
@@ -767,12 +774,24 @@
         shown[k] ? null : h("span", {class:"tag", title:"هذه المجموعة محفوظة لكنها غير معروضة حالياً في أي صفحة من الموقع", text:"غير معروضة"}),
         h("span", {class:"n", text:String(n)})));
     });
+    var XL = window.NowPayXL;
+    if(XL){
+      edSide.appendChild(h("div", {class:"kb-ed-sep", text:"📊 Process Data (ملف Process.xlsx)"}));
+      XL.sheets.forEach(function(s){
+        var k = "xl:" + s.key, m = XL.model(s.key);
+        edSide.appendChild(h("button", {class:"kb-ed-group" + (k === activeGroup ? " active" : ""), type:"button", onclick:function(){ openGroup(k); }},
+          h("span", {text:s.en + (s.ar ? " — " + s.ar : "")}),
+          xlOv[s.key] ? h("span", {class:"tag", text:"معدّلة"}) : null,
+          h("span", {class:"n", text:String(m ? m.rows.length : 0)})));
+      });
+    }
   }
   function openGroup(gid){
     activeGroup = gid; renderSide();
     var v = D()[gid];
     edPane.innerHTML = ""; edPane.scrollTop = 0;
-    if(gid === "topics") topicsView();
+    if(gid.indexOf("xl:") === 0) xlRowsView(gid.slice(3));
+    else if(gid === "topics") topicsView();
     else if(isArr(v) && v.every(isObj)) rowsView(gid);
     else add(edPane, h("p", {class:"kb-note", text:"لا يمكن عرض هذه المجموعة هنا."}));
   }
@@ -851,12 +870,197 @@
     });
   }
 
+
+  /* =========================================================
+     Excel pages (Process.xlsx) — edit rows from the data manager, then download an updated Process.xlsx
+     ========================================================= */
+  var XL_DRAFT_KEY = "nowpay_xl_draft_v1", xlOv = {}, xlBase = {};
+  function xlCount(){ return Object.keys(xlOv).length; }
+  function xlHash(m){ return hashStr(JSON.stringify([m.headers, m.rows])); }
+  function xlPersist(){
+    var sheets = {};
+    Object.keys(xlOv).forEach(function(k){ sheets[k] = { base:xlBase[k], model:xlOv[k] }; });
+    if(Object.keys(sheets).length) lsSet(XL_DRAFT_KEY, JSON.stringify({ saved:Date.now(), sheets:sheets })); else lsDel(XL_DRAFT_KEY);
+  }
+  function xlDiscard(){
+    xlOv = {}; xlBase = {}; lsDel(XL_DRAFT_KEY);
+    if(window.NowPayXL) window.NowPayXL.setOverrides({});
+  }
+  function xlSet(key, m){
+    var XL = window.NowPayXL, fm = XL.fileModel(key);
+    if(!xlBase[key]) xlBase[key] = xlHash(fm);
+    if(deepEq(m, fm)){ delete xlOv[key]; delete xlBase[key]; } else xlOv[key] = m;
+    xlPersist(); XL.setOverrides(xlOv); renderModeBar();
+    if(S.editorOpen) renderSide();
+  }
+  function xlBoot(){
+    var XL = window.NowPayXL; if(!XL) return;
+    var raw = lsGet(XL_DRAFT_KEY), d = null;
+    if(raw){ try{ d = JSON.parse(raw); }catch(e){} }
+    if(d && isObj(d.sheets)){
+      Object.keys(d.sheets).forEach(function(k){ var x = d.sheets[k]; if(x && x.model){ xlOv[k] = x.model; xlBase[k] = x.base; } });
+      XL.setOverrides(xlOv);
+    }
+    var tools = document.querySelector("#xl-panel .xl-tools");
+    if(tools && !tools.querySelector(".kb-xl-edit")){
+      tools.insertBefore(h("button", {class:"kb-ib big kb-xl-edit", type:"button", text:"✏️ تعديل هذه الصفحة", onclick:function(){ openEditor("xl:" + (XL.active() || XL.sheets[0].key)); }}), tools.firstChild);
+    }
+    XL.refresh(false).then(function(ok){
+      if(!ok) return;
+      var dropped = 0;
+      Object.keys(xlOv).forEach(function(k){
+        var fm = XL.fileModel(k);
+        if(fm && xlBase[k] && xlBase[k] !== xlHash(fm)){ delete xlOv[k]; delete xlBase[k]; dropped++; }
+      });
+      if(dropped){ xlPersist(); XL.setOverrides(xlOv); toast("تم رفع Process.xlsx جديد بعد مسودتك، فتم تجاهل مسودة " + dropped + " صفحة إكسيل (عشان ما نكتبش فوق الجديد).", "err", 9000); }
+      renderModeBar(); if(S.editorOpen) renderSide();
+    });
+  }
+
+  function xlTitle(row){
+    var first = null;
+    for(var i = 0; i < row.length; i++){
+      var c = row[i]; if(!c || !c.t) continue;
+      if(first === null) first = c.t;
+      if(!/^[\d\s.,\-]+$/.test(c.t) && !isHttp(c.t)) return trunc(c.t.split("\n")[0], 80);
+    }
+    return trunc(first || "(فارغ)", 80);
+  }
+  function xlSub(row){
+    var t = xlTitle(row), parts = [];
+    row.forEach(function(c){ if(parts.length >= 3 || !c || !c.t) return; var s = trunc(c.t.split("\n")[0], 40); if(s !== trunc(t, 40)) parts.push(s); });
+    return parts.join(" · ");
+  }
+  function xlRowsView(key){
+    var XL = window.NowPayXL;
+    var cfg = XL.sheets.filter(function(s){ return s.key === key; })[0];
+    var label = cfg ? cfg.en + (cfg.ar ? " — " + cfg.ar : "") : key;
+    var q = h("input", {class:"kb-input", type:"search", placeholder:"بحث داخل الصفوف…"});
+    var list = h("div"), hint = h("p", {class:"kb-ed-hint"});
+    function draw(){
+      var m = XL.model(key) || { headers:[], rows:[] }, term = q.value.trim().toLowerCase(), n = 0, matched = 0;
+      list.innerHTML = "";
+      hint.textContent = "عدد الصفوف: " + m.rows.length + ". بيانات الصفحة دي جاية من ملف Process.xlsx. أي تعديل بيتحفظ كمسودة عندك بس. لنشره للفريق: دوسي «تنزيل Process.xlsx المحدّث» وارفعيه على GitHub بنفس الاسم." + (xlOv[key] ? " (هذه الصفحة فيها تعديلات غير منشورة)" : "");
+      m.rows.forEach(function(row, i){
+        var hay = row.map(function(c){ return c ? c.t + " " + (c.link || "") : ""; }).join(" ").toLowerCase();
+        if(term && hay.indexOf(term) < 0) return;
+        matched++;
+        if(n >= 60) return;
+        n++;
+        list.appendChild(h("div", {class:"kb-row-card"},
+          h("div", {class:"kb-row-text"}, h("b", {text:xlTitle(row)}), h("span", {text:xlSub(row)})),
+          h("button", {class:"kb-btn small ghost", type:"button", text:"تعديل", onclick:function(){ xlRowForm(key, i); }})));
+      });
+      if(matched > n) list.appendChild(h("p", {class:"kb-note", text:"يتم عرض أول " + n + " من " + matched + " — استخدم البحث لتضييق النتائج."}));
+      if(!matched) list.appendChild(h("p", {class:"kb-note", text:"لا توجد نتائج."}));
+    }
+    q.addEventListener("input", draw);
+    add(edPane, h("h3", {text:label}), hint,
+      h("div", {class:"kb-ed-toolbar"}, q, h("button", {class:"kb-btn", type:"button", text:"＋ إضافة صف جديد", onclick:function(){ xlRowForm(key, -1); }})),
+      list);
+    draw();
+    if(XL.source() !== "live") XL.refresh(false).then(function(){ if(activeGroup === "xl:" + key) draw(); });
+  }
+  function xlRowForm(key, index){
+    var XL = window.NowPayXL, m = clone(XL.model(key)), isNew = index < 0, base = isNew ? null : m.rows[index];
+    var grid = h("div", {class:"kb-grid2"}), ins = [], lins = [], f = null;
+    m.headers.forEach(function(hd, i){
+      var distinct = m.rows.some(function(r){ return r[i] && r[i].link && r[i].link !== r[i].t; });
+      var long = m.rows.some(function(r){ return r[i] && (r[i].t.indexOf("\n") >= 0 || r[i].t.length > 70); });
+      var val = base && base[i] ? base[i].t : "";
+      var el = long ? h("textarea", {class:"kb-textarea", rows:"4", value:val}) : h("input", {class:"kb-input", type:"text", value:val});
+      ins[i] = el;
+      var w = field(hd, el); if(long) w.style.gridColumn = "1 / -1"; grid.appendChild(w);
+      if(distinct){
+        var li = h("input", {class:"kb-input", type:"text", dir:"ltr", value:(base && base[i] && base[i].link) || ""});
+        lins[i] = li;
+        var w2 = field(hd + " — رابط (اختياري)", li); w2.style.gridColumn = "1 / -1"; grid.appendChild(w2);
+      }
+    });
+    function collect(){
+      var cells = m.headers.map(function(hd, i){
+        var t = ins[i].value.replace(/\r\n?/g, "\n").trim(), oldc = base && base[i] ? base[i] : null, link = null;
+        if(lins[i]){
+          var lv = lins[i].value.trim();
+          if(lv && !isHttp(lv)) throw new Error("الرابط في «" + hd + "» لازم يبدأ بـ http:// أو https://");
+          link = lv || null;
+        } else if(oldc && oldc.link && isHttp(t)) link = t;
+        if(!t && !link) return null;
+        return { t:t || link, link:link };
+      });
+      if(!cells.some(Boolean)) throw new Error("املي خانة واحدة على الأقل.");
+      return cells;
+    }
+    var delBtn = isNew ? null : h("button", {class:"kb-btn danger small", type:"button", text:"🗑 حذف الصف", onclick:function(){
+      if(!window.confirm("حذف الصف ده نهائياً من الصفحة؟")) return;
+      m.rows.splice(index, 1); xlSet(key, m);
+      f.close(true); toast("تم حذف الصف (مسودة). نزّلي Process.xlsx المحدّث لنشر التغيير.", "ok", 4500);
+      if(S.editorOpen && activeGroup === "xl:" + key) openGroup("xl:" + key);
+    }});
+    f = openForm((isNew ? "إضافة صف — " : "تعديل صف — ") + key, grid, {
+      doneMsg:"تم ✓ — محفوظ كمسودة. نزّلي Process.xlsx المحدّث وارفعيه على GitHub لنشره.",
+      footExtra:delBtn,
+      onSave:function(){
+        if(XL.source() !== "live") throw new Error("الموقع لسه ما قرأش ملف Process.xlsx من GitHub. افتحي الموقع من رابطه على الإنترنت (مش من ملف على الجهاز)، استني ثواني وجرّبي تاني.");
+        var cells = collect();
+        if(!isNew && deepEq(cells, base)) throw new Error("لم يتم تغيير أي شيء.");
+        if(isNew) m.rows.push(cells); else m.rows[index] = cells;
+        xlSet(key, m);
+      },
+      after:function(){ if(S.editorOpen && activeGroup === "xl:" + key) openGroup("xl:" + key); }
+    });
+  }
+
+  /* ---- export: Process.xlsx with the edited sheets written back ---- */
+  function xlSheet(m){
+    var X = window.XLSX, ws = {}, idx = m.colIdx || m.headers.map(function(_, i){ return i; });
+    var maxR = 0, maxC = 0, wid = {};
+    function put(r, c, ci){
+      var t = String(ci.t), cell;
+      if(/^-?\d+(\.\d+)?$/.test(t) && t === String(Number(t))) cell = { t:"n", v:Number(t) };
+      else cell = { t:"s", v:t };
+      if(ci.link) cell.l = { Target:ci.link };
+      ws[X.utils.encode_cell({ r:r, c:c })] = cell;
+      if(r > maxR) maxR = r; if(c > maxC) maxC = c;
+      var len = Math.min(60, Math.max.apply(null, t.split("\n").map(function(s){ return s.length; })) + 2);
+      if(!wid[c] || wid[c] < len) wid[c] = len;
+    }
+    m.headers.forEach(function(t, i){
+      var synth = m.blank ? m.blank[i] : /^Column [A-Z]{1,2}$/.test(t);
+      if(!synth) put(0, idx[i], { t:t, link:null });
+    });
+    m.rows.forEach(function(row, r){ row.forEach(function(ci, i){ if(ci) put(r + 1, idx[i], ci); }); });
+    ws["!ref"] = X.utils.encode_range({ s:{ r:0, c:0 }, e:{ r:maxR, c:maxC } });
+    var cols = []; for(var c = 0; c <= maxC; c++) cols.push({ wch:wid[c] || 10 }); ws["!cols"] = cols;
+    return ws;
+  }
+  function downloadXlsx(){
+    var XL = window.NowPayXL;
+    if(!XL || !xlCount()) return toast("لا توجد تعديلات على صفحات الإكسيل لتنزيلها.", "err");
+    XL.loadLib().then(function(){ return XL.getWorkbook().catch(function(){ return null; }); }).then(function(wb){
+      var X = window.XLSX, whole = !wb;
+      if(whole) wb = X.utils.book_new();          /* could not read the published file: rebuild all 4 sheets from the page */
+      XL.sheets.forEach(function(s){
+        var m = whole ? XL.model(s.key) : xlOv[s.key];
+        if(!m) return;
+        var name = XL.sheetName(s.key) || s.en, ws = xlSheet(m);
+        if(wb.SheetNames.indexOf(name) >= 0) wb.Sheets[name] = ws; else X.utils.book_append_sheet(wb, ws, name);
+      });
+      var out = X.write(wb, { bookType:"xlsx", type:"array" });
+      var blob = new Blob([out], { type:"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+      var a = h("a", { href:URL.createObjectURL(blob), download:"Process.xlsx" });
+      document.body.appendChild(a); a.click();
+      setTimeout(function(){ URL.revokeObjectURL(a.href); a.remove(); }, 800);
+      toast("تم تنزيل Process.xlsx المحدّث. ارفعيه على GitHub بنفس الاسم Process.xlsx.", "ok", 7000);
+    }).catch(function(e){ toast("تعذر تجهيز Process.xlsx: " + friendlyError(e), "err", 9000); });
+  }
+
   /* ---------------- boot ---------------- */
   if(editModeOn()){
     var g = loadDraft();
     if(g){ var d0 = clone(D()); Object.keys(g).forEach(function(k){ d0[k] = g[k]; }); App.setData(d0); }
     installHooks();
-    var go = function(){ mountTopbar(); renderModeBar(); };
+    var go = function(){ mountTopbar(); xlBoot(); renderModeBar(); };
     if(document.readyState === "loading") document.addEventListener("DOMContentLoaded", go); else go();
   }
   window.NowPayAdmin = { buildExport:buildExport, changedGroups:changedGroups, editMode:editModeOn };   /* no secrets: there are none */

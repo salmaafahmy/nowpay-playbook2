@@ -166,3 +166,8 @@
 .kb-modebar span{ flex:1 1 320px; text-align:center; }
 .kb-modebar .kb-ib:disabled{ opacity:.5; cursor:default; }
 .kb-userbar #kb-export-btn{ background:rgba(255,255,255,.14); color:#fff; border:1px solid rgba(255,255,255,.35); }
+
+/* ---------- Excel pages (Process.xlsx) editing ---------- */
+.kb-ed-sep{ margin:12px 6px 4px; padding-top:10px; border-top:1px solid var(--border,#DCECEC); font-size:11.5px; font-weight:800; color:var(--text2,#5F7A82); }
+.kb-userbar #kb-export-xlsx-btn{ background:rgba(255,255,255,.14); color:#fff; border:1px solid rgba(255,255,255,.35); }
+.kb-xl-edit{ flex-shrink:0; }
